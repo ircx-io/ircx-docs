@@ -41,8 +41,8 @@ export const SCAN_EXTRA_HOSTS: readonly string[] = Object.freeze([
 /** Reserved top-level names (RFC 2606, RFC 6761) that cannot name a real host. */
 const RESERVED_TLDS: readonly string[] = Object.freeze(['example', 'invalid', 'test', 'localhost']);
 
-/** `ircx-` tokens the scan accepts. */
-export const ALLOWED_REPO_TOKENS: readonly string[] = Object.freeze(['ircx-docs', 'ircx-io']);
+/** `ircx-` tokens the scan accepts: this repository, the organisation, the `ircx-bot` environment and the App's slug. */
+export const ALLOWED_REPO_TOKENS: readonly string[] = Object.freeze(['ircx-bot', 'ircx-docs', 'ircx-io', 'ircx-io-bot']);
 
 /** IPv4 literals the scan accepts: loopback and the unspecified address. */
 const ALLOWED_IPV4: readonly string[] = Object.freeze(['127.0.0.1', '0.0.0.0']);

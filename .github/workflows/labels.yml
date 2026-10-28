@@ -1,0 +1,52 @@
+name: Labels
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions: {}
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    concurrency:
+      group: labels-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Label the pull request by the paths it changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -uo pipefail
+          [[ "$PR" =~ ^[1-9][0-9]{0,9}$ ]] || { echo "the pull request number is malformed"; exit 1; }
+          program='.[] | [.filename, (.previous_filename // empty)] | map(if startswith("content/") then "content" elif (startswith(".github/") or startswith("src/") or startswith("test/") or (. as $f | ["package.json", "package-lock.json", "tsconfig.json", ".npmrc", ".nvmrc", ".gitignore"] | index($f) != null)) then "review-as-code" elif (. as $f | ["README.md", "CONTRIBUTING.md", "SECURITY.md", "LICENSE", "LICENSE-CODE"] | index($f) != null) then "repository-files" else "none" end) | join(" ")'
+          complete=1
+          classes="$(gh api --paginate "repos/ircx-io/ircx-docs/pulls/$PR/files" --jq "$program")" || complete=0
+          expected="$(gh api "repos/ircx-io/ircx-docs/pulls/$PR" --jq .changed_files)" || complete=0
+          [[ "$expected" =~ ^[0-9]+$ ]] || complete=0
+          if [ "$complete" = 1 ] && [ "$(printf '%s\n' "$classes" | grep -c .)" -lt "$expected" ]; then
+            complete=0
+          fi
+          labels=()
+          for name in content review-as-code repository-files; do
+            if printf '%s\n' "$classes" | tr ' ' '\n' | grep -qx "$name"; then
+              labels+=("$name")
+            elif [ "$name" = review-as-code ] && [ "$complete" = 0 ]; then
+              labels+=("$name")
+            fi
+          done
+          if [ "$HEAD_REPO" != "ircx-io/ircx-docs" ]; then
+            labels+=(external)
+          fi
+          if [ "${#labels[@]}" -gt 0 ]; then
+            args=()
+            for name in "${labels[@]}"; do
+              args+=(-f "labels[]=$name")
+            done
+            gh api -X POST "repos/ircx-io/ircx-docs/issues/$PR/labels" "${args[@]}" > /dev/null
+          fi

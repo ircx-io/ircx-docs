@@ -1,25 +1,39 @@
-// Workflow checker. The set of workflow files is exactly {ci.yml}, every
+// Workflow checker. The set of workflow files is exactly WORKFLOW_FILES, every
 // `uses:` line names an approved action at a full commit SHA with a version
-// comment, one action carries one SHA, and after the SHA and version are
-// replaced by placeholders the file equals the canonical text below. No SHA
-// or version is held here, so a Dependabot bump keeps passing.
+// comment, one action carries one SHA across all files, and after the SHA and
+// version are replaced by placeholders each file equals its canonical text
+// below. Structural rules W5 to W13 run beside the compare, so a change that
+// breaks one of them names the rule. No SHA or version is held here, so a
+// Dependabot bump keeps passing.
 
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Finding } from './text.ts';
 
 /** The approved actions. */
-export const APPROVED_ACTIONS: readonly string[] = Object.freeze(['actions/checkout', 'actions/setup-node']);
+export const APPROVED_ACTIONS: readonly string[] = Object.freeze(['actions/checkout', 'actions/create-github-app-token', 'actions/setup-node']);
 
 /** The only workflow files allowed under .github/workflows/. */
-export const WORKFLOW_FILES: readonly string[] = Object.freeze(['ci.yml']);
+export const WORKFLOW_FILES: readonly string[] = Object.freeze(['ci.yml', 'cut-release.yml', 'dependabot-merge.yml', 'labels.yml', 'settings-check.yml']);
 
-const USES_LINE = /^( *)(- )?uses: (actions\/checkout|actions\/setup-node)@[0-9a-f]{40} # v[0-9]+\.[0-9]+\.[0-9]+$/;
+/** The workflows that hold a key job, and the name of that job (SC-U2-42 b). */
+export const KEY_JOBS: Readonly<Record<string, string>> = Object.freeze({
+  'cut-release.yml': 'release',
+  'dependabot-merge.yml': 'merge',
+  'settings-check.yml': 'read',
+});
+
+/** The one line through which a workflow may read a secret. */
+export const PRIVATE_KEY_LINE = 'private-key: ${{ secrets.IRCX_BOT_PRIVATE_KEY }}';
+
+const APP_TOKEN_ACTION = 'actions/create-github-app-token';
+const USES_LINE = /^( *)(- )?uses: (actions\/checkout|actions\/setup-node|actions\/create-github-app-token)@[0-9a-f]{40} # v[0-9]+\.[0-9]+\.[0-9]+$/;
 const USES_ANY = /^\s*(?:- )?uses:/;
 const PIN = /@([0-9a-f]{40}) # /;
 
-/** ci.yml with each `uses:` SHA and version replaced by placeholders. */
-export const CANONICAL_CI = `name: CI
+/** Each workflow file with every `uses:` SHA and version replaced by placeholders. */
+export const CANONICAL: Readonly<Record<string, string>> = Object.freeze({
+  'ci.yml': `name: CI
 
 on:
   pull_request:
@@ -51,7 +65,386 @@ jobs:
       - run: npm test
       - run: npm run check
       - run: npm run scan
-`;
+`,
+  'cut-release.yml': `name: Cut release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, vYYYY.MM.DD in UTC, with .2 to .9 appended for a later release the same day
+        required: true
+        type: string
+      revision:
+        description: The full commit SHA of the revision the frontend pins
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ircx-bot
+    permissions:
+      contents: read
+    steps:
+      - name: Validate the inputs
+        env:
+          GH_TOKEN: \${{ github.token }}
+          TAG: \${{ inputs.tag }}
+          REVISION: \${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}(\\.[2-9])?$ ]] || { echo "the tag must be vYYYY.MM.DD, optionally followed by .2 to .9"; exit 1; }
+          [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "the revision must be a full lowercase commit SHA"; exit 1; }
+          status="$(gh api "repos/ircx-io/ircx-docs/compare/$REVISION...main" --jq .status)"
+          case "$status" in
+            ahead | identical) ;;
+            *) echo "the revision is not on main"; exit 1 ;;
+          esac
+          if lookup="$(gh api "repos/ircx-io/ircx-docs/git/ref/tags/$TAG" 2>&1)"; then
+            echo "the tag already exists"
+            exit 1
+          fi
+          case "$lookup" in
+            *"(HTTP 404)"*) ;;
+            *) echo "the tag lookup failed"; exit 1 ;;
+          esac
+      - id: token
+        uses: actions/create-github-app-token@<sha> # <version>
+        with:
+          client-id: Iv23liAz4GUkls9I3nc2
+          private-key: \${{ secrets.IRCX_BOT_PRIVATE_KEY }}
+          owner: ircx-io
+          repositories: ircx-docs
+          permission-contents: write
+          permission-workflows: write
+      - name: Create the release
+        env:
+          GH_TOKEN: \${{ steps.token.outputs.token }}
+          TAG: \${{ inputs.tag }}
+          REVISION: \${{ inputs.revision }}
+        run: gh api -X POST repos/ircx-io/ircx-docs/releases -f "tag_name=$TAG" -f "target_commitish=$REVISION" -F generate_release_notes=true -f make_latest=true -F draft=false > /dev/null
+`,
+  'dependabot-merge.yml': `name: Dependabot merge
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  decide:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.path == '.github/workflows/ci.yml' &&
+      github.event.workflow_run.head_repository.full_name == 'ircx-io/ircx-docs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      merge: \${{ steps.decide.outputs.merge }}
+      number: \${{ steps.decide.outputs.number }}
+      sha: \${{ steps.decide.outputs.sha }}
+      workflows: \${{ steps.decide.outputs.workflows }}
+    steps:
+      - uses: actions/checkout@<sha> # <version>
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@<sha> # <version>
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Read the pull request
+        env:
+          GH_TOKEN: \${{ github.token }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/dependabot"
+          mkdir -p "$dir"
+          printf '{}\\n' > "$dir/pr.json"
+          printf '[]\\n' > "$dir/commits.json"
+          printf '[]\\n' > "$dir/files.json"
+          pr="$(jq -r '.workflow_run.pull_requests[0].number // ""' "$GITHUB_EVENT_PATH")"
+          if [[ "$pr" =~ ^[1-9][0-9]{0,9}$ ]]; then
+            gh api "repos/ircx-io/ircx-docs/pulls/$pr" > "$dir/pr.json"
+            gh api --paginate "repos/ircx-io/ircx-docs/pulls/$pr/commits" | jq -s 'add // []' > "$dir/commits.json"
+            gh api --paginate "repos/ircx-io/ircx-docs/pulls/$pr/files" | jq -s 'add // []' > "$dir/files.json"
+          fi
+      - id: decide
+        run: node src/dependabot.ts "$GITHUB_EVENT_PATH" "$RUNNER_TEMP/dependabot/pr.json" "$RUNNER_TEMP/dependabot/commits.json" "$RUNNER_TEMP/dependabot/files.json" >> "$GITHUB_OUTPUT"
+
+  merge:
+    needs: decide
+    if: needs.decide.outputs.merge == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ircx-bot
+    permissions: {}
+    steps:
+      - name: Validate the decision
+        env:
+          NUMBER: \${{ needs.decide.outputs.number }}
+          SHA: \${{ needs.decide.outputs.sha }}
+          WORKFLOWS: \${{ needs.decide.outputs.workflows }}
+        run: |
+          set -euo pipefail
+          [[ "$NUMBER" =~ ^[1-9][0-9]{0,9}$ ]] || { echo "the pull request number is malformed"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "the head SHA is malformed"; exit 1; }
+          [[ "$WORKFLOWS" =~ ^(true|false)$ ]] || { echo "the workflows flag is malformed"; exit 1; }
+      - id: contents-token
+        if: needs.decide.outputs.workflows == 'false'
+        uses: actions/create-github-app-token@<sha> # <version>
+        with:
+          client-id: Iv23liAz4GUkls9I3nc2
+          private-key: \${{ secrets.IRCX_BOT_PRIVATE_KEY }}
+          owner: ircx-io
+          repositories: ircx-docs
+          permission-contents: write
+      - id: workflows-token
+        if: needs.decide.outputs.workflows == 'true'
+        uses: actions/create-github-app-token@<sha> # <version>
+        with:
+          client-id: Iv23liAz4GUkls9I3nc2
+          private-key: \${{ secrets.IRCX_BOT_PRIVATE_KEY }}
+          owner: ircx-io
+          repositories: ircx-docs
+          permission-contents: write
+          permission-workflows: write
+      - name: Squash-merge at the checked head
+        env:
+          GH_TOKEN: \${{ steps.contents-token.outputs.token || steps.workflows-token.outputs.token }}
+          NUMBER: \${{ needs.decide.outputs.number }}
+          SHA: \${{ needs.decide.outputs.sha }}
+        run: gh api -X PUT repos/ircx-io/ircx-docs/pulls/$NUMBER/merge -f merge_method=squash -f sha=$SHA
+`,
+  'labels.yml': `name: Labels
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions: {}
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    concurrency:
+      group: labels-\${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Label the pull request by the paths it changes
+        env:
+          GH_TOKEN: \${{ github.token }}
+          PR: \${{ github.event.pull_request.number }}
+          HEAD_REPO: \${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -uo pipefail
+          [[ "$PR" =~ ^[1-9][0-9]{0,9}$ ]] || { echo "the pull request number is malformed"; exit 1; }
+          program='.[] | [.filename, (.previous_filename // empty)] | map(if startswith("content/") then "content" elif (startswith(".github/") or startswith("src/") or startswith("test/") or (. as $f | ["package.json", "package-lock.json", "tsconfig.json", ".npmrc", ".nvmrc", ".gitignore"] | index($f) != null)) then "review-as-code" elif (. as $f | ["README.md", "CONTRIBUTING.md", "SECURITY.md", "LICENSE", "LICENSE-CODE"] | index($f) != null) then "repository-files" else "none" end) | join(" ")'
+          complete=1
+          classes="$(gh api --paginate "repos/ircx-io/ircx-docs/pulls/$PR/files" --jq "$program")" || complete=0
+          expected="$(gh api "repos/ircx-io/ircx-docs/pulls/$PR" --jq .changed_files)" || complete=0
+          [[ "$expected" =~ ^[0-9]+$ ]] || complete=0
+          if [ "$complete" = 1 ] && [ "$(printf '%s\\n' "$classes" | grep -c .)" -lt "$expected" ]; then
+            complete=0
+          fi
+          labels=()
+          for name in content review-as-code repository-files; do
+            if printf '%s\\n' "$classes" | tr ' ' '\\n' | grep -qx "$name"; then
+              labels+=("$name")
+            elif [ "$name" = review-as-code ] && [ "$complete" = 0 ]; then
+              labels+=("$name")
+            fi
+          done
+          if [ "$HEAD_REPO" != "ircx-io/ircx-docs" ]; then
+            labels+=(external)
+          fi
+          if [ "\${#labels[@]}" -gt 0 ]; then
+            args=()
+            for name in "\${labels[@]}"; do
+              args+=(-f "labels[]=$name")
+            done
+            gh api -X POST "repos/ircx-io/ircx-docs/issues/$PR/labels" "\${args[@]}" > /dev/null
+          fi
+`,
+  'settings-check.yml': `name: Settings check
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ircx-bot
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      repository: \${{ steps.read.outputs.repository }}
+      actions-permissions: \${{ steps.read.outputs.actions-permissions }}
+      selected-actions: \${{ steps.read.outputs.selected-actions }}
+      workflow-permissions: \${{ steps.read.outputs.workflow-permissions }}
+      fork-pr-approval: \${{ steps.read.outputs.fork-pr-approval }}
+      vulnerability-alerts: \${{ steps.read.outputs.vulnerability-alerts }}
+      private-vulnerability-reporting: \${{ steps.read.outputs.private-vulnerability-reporting }}
+      rulesets: \${{ steps.read.outputs.rulesets }}
+      actions-secrets: \${{ steps.read.outputs.actions-secrets }}
+      dependabot-secrets: \${{ steps.read.outputs.dependabot-secrets }}
+      environment-secrets: \${{ steps.read.outputs.environment-secrets }}
+      environment-variables: \${{ steps.read.outputs.environment-variables }}
+      environments: \${{ steps.read.outputs.environments }}
+      branch-policies: \${{ steps.read.outputs.branch-policies }}
+      releases: \${{ steps.read.outputs.releases }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@<sha> # <version>
+        with:
+          client-id: Iv23liAz4GUkls9I3nc2
+          private-key: \${{ secrets.IRCX_BOT_PRIVATE_KEY }}
+          owner: ircx-io
+          repositories: ircx-docs
+          permission-administration: read
+          permission-secrets: read
+          permission-dependabot-secrets: read
+          permission-environments: read
+      - id: read
+        env:
+          APP_TOKEN: \${{ steps.token.outputs.token }}
+          JOB_TOKEN: \${{ github.token }}
+        run: |
+          set -uo pipefail
+          repo=repos/ircx-io/ircx-docs
+          record() {
+            printf '%s=%s\\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+          }
+          with_app() {
+            local value
+            if value="$(GH_TOKEN="$APP_TOKEN" gh api "$2" | jq -c .)"; then record "$1" "$value"; else record "$1" ""; fi
+          }
+          with_job() {
+            local value
+            if value="$(GH_TOKEN="$JOB_TOKEN" gh api --paginate "$2" | jq -c -s .)"; then record "$1" "$value"; else record "$1" ""; fi
+          }
+          with_app repository "$repo"
+          with_app actions-permissions "$repo/actions/permissions"
+          with_app selected-actions "$repo/actions/permissions/selected-actions"
+          with_app workflow-permissions "$repo/actions/permissions/workflow"
+          with_app fork-pr-approval "$repo/actions/permissions/fork-pr-contributor-approval"
+          with_app private-vulnerability-reporting "$repo/private-vulnerability-reporting"
+          with_app actions-secrets "$repo/actions/secrets"
+          with_app dependabot-secrets "$repo/dependabot/secrets"
+          with_app environment-secrets "$repo/environments/ircx-bot/secrets"
+          with_app environment-variables "$repo/environments/ircx-bot/variables"
+          if alerts="$(GH_TOKEN="$APP_TOKEN" gh api "$repo/vulnerability-alerts" 2>&1)"; then
+            record vulnerability-alerts '{"enabled":true}'
+          else
+            case "$alerts" in
+              *"(HTTP 404)"*) record vulnerability-alerts '{"enabled":false}' ;;
+              *) record vulnerability-alerts "" ;;
+            esac
+          fi
+          rulesets=""
+          if ids="$(GH_TOKEN="$APP_TOKEN" gh api "$repo/rulesets" --jq '.[].id')"; then
+            rulesets="[]"
+            for id in $ids; do
+              [[ "$id" =~ ^[0-9]{1,12}$ ]] || { rulesets=""; break; }
+              one="$(GH_TOKEN="$APP_TOKEN" gh api "$repo/rulesets/$id" | jq -c .)" || { rulesets=""; break; }
+              rulesets="$(jq -c --argjson one "$one" '. + [$one]' <<< "$rulesets")" || { rulesets=""; break; }
+            done
+          fi
+          record rulesets "$rulesets"
+          with_job environments "$repo/environments"
+          with_job branch-policies "$repo/environments/ircx-bot/deployment-branch-policies"
+          with_job releases "$repo/releases"
+
+  compare:
+    needs: read
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@<sha> # <version>
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@<sha> # <version>
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Write the responses to files
+        env:
+          REPOSITORY: \${{ needs.read.outputs.repository }}
+          ACTIONS_PERMISSIONS: \${{ needs.read.outputs.actions-permissions }}
+          SELECTED_ACTIONS: \${{ needs.read.outputs.selected-actions }}
+          WORKFLOW_PERMISSIONS: \${{ needs.read.outputs.workflow-permissions }}
+          FORK_PR_APPROVAL: \${{ needs.read.outputs.fork-pr-approval }}
+          VULNERABILITY_ALERTS: \${{ needs.read.outputs.vulnerability-alerts }}
+          PRIVATE_VULNERABILITY_REPORTING: \${{ needs.read.outputs.private-vulnerability-reporting }}
+          RULESETS: \${{ needs.read.outputs.rulesets }}
+          ACTIONS_SECRETS: \${{ needs.read.outputs.actions-secrets }}
+          DEPENDABOT_SECRETS: \${{ needs.read.outputs.dependabot-secrets }}
+          ENVIRONMENT_SECRETS: \${{ needs.read.outputs.environment-secrets }}
+          ENVIRONMENT_VARIABLES: \${{ needs.read.outputs.environment-variables }}
+          ENVIRONMENTS: \${{ needs.read.outputs.environments }}
+          BRANCH_POLICIES: \${{ needs.read.outputs.branch-policies }}
+          RELEASES: \${{ needs.read.outputs.releases }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/settings"
+          mkdir -p "$dir"
+          printf '%s' "$REPOSITORY" > "$dir/repository.json"
+          printf '%s' "$ACTIONS_PERMISSIONS" > "$dir/actions-permissions.json"
+          printf '%s' "$SELECTED_ACTIONS" > "$dir/selected-actions.json"
+          printf '%s' "$WORKFLOW_PERMISSIONS" > "$dir/workflow-permissions.json"
+          printf '%s' "$FORK_PR_APPROVAL" > "$dir/fork-pr-approval.json"
+          printf '%s' "$VULNERABILITY_ALERTS" > "$dir/vulnerability-alerts.json"
+          printf '%s' "$PRIVATE_VULNERABILITY_REPORTING" > "$dir/private-vulnerability-reporting.json"
+          printf '%s' "$RULESETS" > "$dir/rulesets.json"
+          printf '%s' "$ACTIONS_SECRETS" > "$dir/actions-secrets.json"
+          printf '%s' "$DEPENDABOT_SECRETS" > "$dir/dependabot-secrets.json"
+          printf '%s' "$ENVIRONMENT_SECRETS" > "$dir/environment-secrets.json"
+          printf '%s' "$ENVIRONMENT_VARIABLES" > "$dir/environment-variables.json"
+          printf '%s' "$ENVIRONMENTS" > "$dir/environments.json"
+          printf '%s' "$BRANCH_POLICIES" > "$dir/branch-policies.json"
+          printf '%s' "$RELEASES" > "$dir/releases.json"
+      - id: compare
+        run: |
+          set -o pipefail
+          node src/settings.ts "$RUNNER_TEMP/settings" | tee "$RUNNER_TEMP/findings.txt"
+      - name: Report the drift in an issue
+        if: failure() && steps.compare.outcome == 'failure'
+        env:
+          GH_TOKEN: \${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body="$(printf 'The weekly settings check found drift.\\n\\nFindings:\\n\\n%s\\n\\nRun: %s\\n' "$(cat "$RUNNER_TEMP/findings.txt")" "$run_url")"
+          number="$(gh api "repos/ircx-io/ircx-docs/issues?state=open&labels=settings-drift" --jq '[.[] | select(.user.login == "github-actions[bot]" and (.pull_request | not))][0].number // ""')"
+          if [[ "$number" =~ ^[1-9][0-9]{0,9}$ ]]; then
+            gh api -X POST "repos/ircx-io/ircx-docs/issues/$number/comments" -f "body=$body" > /dev/null
+          else
+            gh api -X POST repos/ircx-io/ircx-docs/issues -f "title=Weekly settings check found drift" -f "body=$body" -f "labels[]=settings-drift" > /dev/null
+          fi
+`,
+});
 
 /**
  * Replaces the SHA and version of each well-formed `uses:` line with
@@ -81,6 +474,238 @@ export function normalise(file: string, text: string, shas: Map<string, string>)
     lines[i] = `${m[1] ?? ''}${m[2] ?? ''}uses: ${action}@<sha> # <version>`;
   }
   return { text: lines.join('\n'), findings };
+}
+
+interface Step {
+  /** 0-based index of the step's first line. */
+  readonly start: number;
+  readonly lines: readonly string[];
+  /** The action a `uses:` line names, without its pin. */
+  readonly uses: string | undefined;
+}
+
+interface Job {
+  readonly name: string;
+  readonly start: number;
+  readonly lines: readonly string[];
+  readonly steps: readonly Step[];
+}
+
+function indentOf(line: string): number {
+  return line.length - line.trimStart().length;
+}
+
+/** Splits the `jobs:` mapping into jobs (two-space keys) and their steps (six-space items). */
+function parseJobs(lines: readonly string[]): Job[] {
+  const jobs: Job[] = [];
+  const top = lines.findIndex((l) => l === 'jobs:');
+  if (top < 0) {
+    return jobs;
+  }
+  const starts: Array<{ name: string; start: number }> = [];
+  let end = lines.length;
+  for (let i = top + 1; i < lines.length; i++) {
+    const line = lines[i] ?? '';
+    if (/^\S/.test(line)) {
+      end = i;
+      break;
+    }
+    const m = /^ {2}([A-Za-z0-9_-]+):\s*$/.exec(line);
+    if (m !== null) {
+      starts.push({ name: m[1] ?? '', start: i });
+    }
+  }
+  starts.forEach((s, n) => {
+    const stop = starts[n + 1]?.start ?? end;
+    const body = lines.slice(s.start, stop);
+    const steps: Step[] = [];
+    const stepStarts = body.map((l, i) => (/^ {6}- /.test(l) ? i : -1)).filter((i) => i >= 0);
+    stepStarts.forEach((first, k) => {
+      let last = stepStarts[k + 1] ?? body.length;
+      while (last > first + 1 && !/^ {7,}\S/.test(body[last - 1] ?? '')) {
+        last--;
+      }
+      const stepLines = body.slice(first, last);
+      const uses = stepLines.map((l) => /^\s*(?:- )?uses: ([^@\s]+)/.exec(l)?.[1]).find((u) => u !== undefined);
+      steps.push({ start: s.start + first, lines: stepLines, uses });
+    });
+    jobs.push({ name: s.name, start: s.start, lines: body, steps });
+  });
+  return jobs;
+}
+
+/** The 0-based indices of the lines that hold shell text: a `run:` value and its block. */
+function runLines(lines: readonly string[]): Set<number> {
+  const out = new Set<number>();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? '';
+    const m = /^(\s*)(- )?run:(.*)$/.exec(line);
+    if (m === null) {
+      continue;
+    }
+    out.add(i);
+    const keyIndent = (m[1] ?? '').length + (m[2] ?? '').length;
+    if (/^\s*[|>][-+]?\s*$/.test(m[3] ?? '')) {
+      for (let j = i + 1; j < lines.length; j++) {
+        const next = lines[j] ?? '';
+        if (next.trim() !== '' && indentOf(next) <= keyIndent) {
+          break;
+        }
+        out.add(j);
+      }
+    }
+  }
+  return out;
+}
+
+/** Text in a key job's shell that runs repository code or a script (rule W10). */
+const KEY_JOB_FORBIDDEN: readonly RegExp[] = [
+  /(?:^|[\s;&|(])(?:node|npm|npx|source)(?:\s|$)/,
+  /(?:^|[\s;&|(])(?:bash|sh)\s+[^-\s]/,
+  /(?:^|[;&|(]\s*)\.\s+\S/,
+  /(?:^|[\s"'=(])(?:\.\/|src\/|test\/|content\/|\.github\/)/,
+];
+
+/** The `secrets` context inside an expression; a name such as `outputs.actions-secrets` is not it. */
+const SECRETS_CONTEXT = /\$\{\{.*(?<![\w.-])secrets(?![\w-])/;
+
+/** Applies the structural rules W5 to W13 to one workflow file. */
+export function structuralFindings(name: string, text: string): Finding[] {
+  const file = `.github/workflows/${name}`;
+  const findings: Finding[] = [];
+  const push = (line: number | undefined, rule: string, message: string): void => {
+    findings.push(line === undefined ? { file, rule, message } : { file, line: line + 1, rule, message });
+  };
+  const lines = text.split('\n');
+  const shell = runLines(lines);
+  const jobs = parseJobs(lines);
+  const stepAt = (i: number): Step | undefined => {
+    for (const job of jobs) {
+      for (const step of job.steps) {
+        if (i >= step.start && i < step.start + step.lines.length) {
+          return step;
+        }
+      }
+    }
+    return undefined;
+  };
+  const keyJob = KEY_JOBS[name];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? '';
+    // W5: shell text never interpolates an expression.
+    if (shell.has(i) && line.includes('${{')) {
+      push(i, 'W5', 'an expression inside a run: block');
+    }
+    // W6: secrets reach a workflow only through the private-key input of an App token step in a key workflow.
+    const readsSecrets = SECRETS_CONTEXT.test(line) || /(?<![\w.-])secrets\s*:\s*inherit\b/.test(line);
+    if (readsSecrets) {
+      const ok = line.trim() === PRIVATE_KEY_LINE && keyJob !== undefined && stepAt(i)?.uses === APP_TOKEN_ACTION;
+      if (!ok) {
+        push(i, 'W6', 'secrets are read outside the private-key input of an App token step');
+      }
+    }
+    // W8: pull_request_target only in labels.yml.
+    if (line.includes('pull_request_target') && name !== 'labels.yml') {
+      push(i, 'W8', 'pull_request_target outside labels.yml');
+    }
+    if (name === 'labels.yml' && USES_ANY.test(line)) {
+      push(i, 'W8', 'labels.yml runs no action');
+    }
+    // W9: no broad or write token grant.
+    if (/id-token|write-all|(?<![\w-])actions:\s*write|(?<![\w-])contents:\s*write/.test(line)) {
+      push(i, 'W9', 'a broad or write token permission');
+    }
+    // W12: no github.actor and no debug switch.
+    if (/github\.actor|set -x|GH_DEBUG|ACTIONS_STEP_DEBUG/.test(line)) {
+      push(i, 'W12', 'github.actor or a debug switch');
+    }
+  }
+
+  // W7: exactly one environment, ircx-bot, on the key job of a key workflow; none elsewhere.
+  const envLines = lines.map((l, i) => (/^\s*environment:/.test(l) ? i : -1)).filter((i) => i >= 0);
+  if (keyJob === undefined) {
+    for (const i of envLines) {
+      push(i, 'W7', 'an environment outside a key workflow');
+    }
+  } else {
+    const owner = jobs.find((j) => j.name === keyJob);
+    const good = envLines.filter((i) => lines[i] === '    environment: ircx-bot' && owner !== undefined && i > owner.start && i < owner.start + owner.lines.length);
+    if (envLines.length !== 1 || good.length !== 1) {
+      push(envLines[0], 'W7', `exactly one environment: ircx-bot, on job ${keyJob}`);
+    }
+  }
+
+  // W9: top-level permissions.
+  if (name === 'ci.yml') {
+    if (!text.includes('\npermissions:\n  contents: read\n')) {
+      push(undefined, 'W9', 'ci.yml keeps top-level permissions: contents: read');
+    }
+  } else if (!lines.includes('permissions: {}')) {
+    push(undefined, 'W9', 'top-level permissions: {}');
+  }
+
+  // W10: a job that names an environment runs only App token steps and its own shell text.
+  for (const job of jobs) {
+    if (!job.lines.some((l) => /^\s*environment:/.test(l))) {
+      continue;
+    }
+    for (const step of job.steps) {
+      if (step.uses !== undefined) {
+        if (step.uses !== APP_TOKEN_ACTION) {
+          push(step.start, 'W10', `job ${job.name} runs an action other than the App token`);
+        }
+        continue;
+      }
+      step.lines.forEach((l, k) => {
+        if (shell.has(step.start + k)) {
+          const body = l.replace(/^\s*(- )?run:\s*/, ' ');
+          if (KEY_JOB_FORBIDDEN.some((re) => re.test(body))) {
+            push(step.start + k, 'W10', `job ${job.name} runs repository code or a script`);
+          }
+        }
+      });
+    }
+  }
+
+  // W11: every App token step names this App, this owner and this repository, and asks for something.
+  for (const job of jobs) {
+    for (const step of job.steps) {
+      if (step.uses !== APP_TOKEN_ACTION) {
+        continue;
+      }
+      const inputs = step.lines.map((l) => l.trim());
+      const permissions = inputs.filter((l) => l.startsWith('permission-'));
+      const problems: string[] = [];
+      if (!inputs.some((l) => /^client-id: [A-Za-z0-9]+$/.test(l))) {
+        problems.push('a literal client-id');
+      }
+      if (!inputs.includes('owner: ircx-io')) {
+        problems.push('owner: ircx-io');
+      }
+      if (!inputs.includes('repositories: ircx-docs')) {
+        problems.push('repositories: ircx-docs');
+      }
+      if (permissions.length === 0) {
+        problems.push('at least one permission- input');
+      }
+      if (inputs.some((l) => l.startsWith('skip-token-revoke'))) {
+        problems.push('no skip-token-revoke');
+      }
+      if (name === 'settings-check.yml' && permissions.some((l) => !/^permission-[a-z-]+: read$/.test(l))) {
+        problems.push('read permissions only');
+      }
+      if (problems.length > 0) {
+        push(step.start, 'W11', `the App token step needs ${problems.join(', ')}`);
+      }
+    }
+  }
+
+  // W13: only ci.yml is named CI, because the merge workflow and the required check key on it.
+  if (name !== 'ci.yml' && lines.includes('name: CI')) {
+    push(undefined, 'W13', 'only ci.yml is named CI');
+  }
+  return findings;
 }
 
 function listFiles(dir: string, prefix: string): string[] {
@@ -121,9 +746,11 @@ export function checkWorkflows(root: string): Finding[] {
     }
     const normalised = normalise(file, text, shas);
     findings.push(...normalised.findings);
-    if (normalised.text !== CANONICAL_CI) {
+    findings.push(...structuralFindings(name, text));
+    const canonical = CANONICAL[name] ?? '';
+    if (normalised.text !== canonical) {
       const got = normalised.text.split('\n');
-      const want = CANONICAL_CI.split('\n');
+      const want = canonical.split('\n');
       let line = 0;
       while (line < got.length && line < want.length && got[line] === want[line]) {
         line++;

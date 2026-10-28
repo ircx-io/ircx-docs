@@ -3,10 +3,12 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
-import { APPROVED_ACTIONS, CANONICAL_CI, checkWorkflows, normalise, WORKFLOW_FILES } from '../src/workflows.ts';
+import { APPROVED_ACTIONS, CANONICAL, checkWorkflows, normalise, structuralFindings, WORKFLOW_FILES } from '../src/workflows.ts';
 
 const ROOT = resolve(import.meta.dirname, '..');
-const REAL = readFileSync(join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+const NAMES = ['ci.yml', 'cut-release.yml', 'dependabot-merge.yml', 'labels.yml', 'settings-check.yml'];
+const FILES: Readonly<Record<string, string>> = Object.fromEntries(NAMES.map((n) => [n, readFileSync(join(ROOT, '.github', 'workflows', n), 'utf8')]));
+const REAL = FILES['ci.yml'] ?? '';
 
 /** Runs the checker on a temporary tree whose workflows directory holds `files`. */
 function check(files: Record<string, string>): string[] {
@@ -22,10 +24,16 @@ function check(files: Record<string, string>): string[] {
   }
 }
 
+/** Runs the checker on the real five files with `name` transformed. */
+function mutantIn(name: string, transform: (text: string) => string): string[] {
+  const before = FILES[name] ?? '';
+  const out = transform(before);
+  assert.notEqual(out, before, 'the mutant changed nothing');
+  return check({ ...FILES, [name]: out });
+}
+
 function mutant(transform: (text: string) => string): string[] {
-  const out = transform(REAL);
-  assert.notEqual(out, REAL, 'the mutant changed nothing');
-  return check({ 'ci.yml': out });
+  return mutantIn('ci.yml', transform);
 }
 
 /** Replaces exactly one occurrence. */
@@ -53,15 +61,13 @@ function usesLine(action: string): string {
 
 test('the canonical ci.yml passes', () => {
   assert.deepEqual(checkWorkflows(ROOT), []);
-  assert.deepEqual([...WORKFLOW_FILES], ['ci.yml']);
-  assert.deepEqual([...APPROVED_ACTIONS], ['actions/checkout', 'actions/setup-node']);
+  assert.deepEqual([...WORKFLOW_FILES], NAMES);
+  assert.deepEqual([...APPROVED_ACTIONS], ['actions/checkout', 'actions/create-github-app-token', 'actions/setup-node']);
+  assert.deepEqual(check({ ...FILES }), []);
 });
 
 test('SC-U2-1 the real ci.yml states each requirement, independent of the canonical text', () => {
   const lines = REAL.split('\n');
-  assert.ok(REAL.startsWith('name: CI\n'), 'the workflow is named CI, which the required check depends on');
-  const jobsAt = lines.indexOf('jobs:');
-  assert.deepEqual(lines.slice(jobsAt + 1).filter((l) => /^ {2}[A-Za-z_-]+:/.test(l)), ['  docs:'], 'one job, named docs');
   assert.equal(lines.filter((l) => /^on:/.test(l)).length, 1);
   assert.ok(REAL.includes('on:\n  pull_request:\n  push:\n    branches: [main]\n'));
   assert.ok(REAL.includes('\npermissions:\n  contents: read\n'));
@@ -126,15 +132,23 @@ test('SC-U2-1 each requirement has a failing mutant (W4: differs from the canoni
 });
 
 test('SC-U2-2 a Dependabot SHA and version bump still passes', () => {
-  const bumped = REAL.replace(USES, (_m, indent: string, dash: string | undefined, action: string, sha: string, version: string) => {
-    const major = Number(/^v(\d+)/.exec(version)?.[1] ?? '0');
-    return `${indent}${dash ?? ''}uses: ${action}@${otherSha(sha)} # v${major + 1}.2.3`;
-  });
-  assert.notEqual(bumped, REAL);
-  for (const action of APPROVED_ACTIONS) {
-    assert.notEqual(usesLine(action), bumped.split('\n').find((l) => l.includes(`uses: ${action}@`)));
+  const bump = (text: string): string =>
+    text.replace(USES, (_m, indent: string, dash: string | undefined, action: string, sha: string, version: string) => {
+      const major = Number(/^v(\d+)/.exec(version)?.[1] ?? '0');
+      return `${indent}${dash ?? ''}uses: ${action}@${otherSha(sha)} # v${major + 1}.2.3`;
+    });
+  const bumped = Object.fromEntries(NAMES.map((n) => [n, bump(FILES[n] ?? '')]));
+  const seen = new Set<string>();
+  for (const n of NAMES) {
+    for (const m of (FILES[n] ?? '').matchAll(USES)) {
+      seen.add(m[3] ?? '');
+    }
+    if (n !== 'labels.yml') {
+      assert.notEqual(bumped[n], FILES[n], n);
+    }
   }
-  assert.deepEqual(check({ 'ci.yml': bumped }), []);
+  assert.deepEqual([...seen].sort(), [...APPROVED_ACTIONS]);
+  assert.deepEqual(check(bumped), []);
 });
 
 test('SC-U2-2 normalise abstracts only the SHA and the version, keeping indent, marker and name', () => {
@@ -182,9 +196,9 @@ test('SC-U2-2 each malformed or unapproved uses line is a W2 finding', () => {
   }
 });
 
-test('SC-U2-2 normalise accepts only the two approved action names', () => {
+test('SC-U2-2 normalise accepts only the three approved action names', () => {
   const sha = 'd'.repeat(40);
-  for (const action of ['actions/cache', 'actions/upload-artifact', 'actions/checkout-evil', 'actions/checkout/sub', 'evil/checkout', 'actions/setup-node2']) {
+  for (const action of ['actions/cache', 'actions/upload-artifact', 'actions/checkout-evil', 'actions/checkout/sub', 'evil/checkout', 'actions/setup-node2', 'dependabot/fetch-metadata', 'actions/create-github-app-token-x']) {
     const n = normalise('f', `      - uses: ${action}@${sha} # v1.2.3\n`, new Map());
     assert.deepEqual(n.findings.map((f) => f.rule), ['W2'], action);
     assert.ok(n.text.includes(sha), 'a refused line is left as written');
@@ -217,17 +231,21 @@ test('SC-U2-2 each action carries one SHA across the file', () => {
   assert.ok(!same.includes('W3'));
 });
 
-test('SC-U2-2 the set of workflow files is exactly ci.yml', () => {
-  assert.deepEqual(check({ 'ci.yml': REAL }), []);
-  assert.deepEqual(check({ 'ci.yml': REAL, 'release.yml': REAL }), ['W1']);
-  assert.deepEqual(check({ 'ci.yml': REAL, 'ci.yaml': REAL }), ['W1']);
-  assert.ok(check({ 'ci.yaml': REAL }).includes('W1'));
+test('SC-U2-2 the set of workflow files is exactly the five', () => {
+  assert.deepEqual(check({ ...FILES }), []);
+  assert.deepEqual(check({ ...FILES, 'release-notes.yml': REAL }), ['W1']);
+  assert.deepEqual(check({ ...FILES, 'ci.yaml': REAL }), ['W1']);
+  const { 'labels.yml': _dropped, ...four } = FILES;
+  assert.ok(check(four).includes('W1'));
+  assert.ok(check({ 'ci.yml': REAL }).includes('W1'));
   assert.ok(check({}).includes('W1'));
   const root = mkdtempSync(join(tmpdir(), 'docs-wf-'));
   try {
     assert.deepEqual(checkWorkflows(root).map((f) => f.rule), ['W1']);
     mkdirSync(join(root, '.github', 'workflows', 'sub'), { recursive: true });
-    writeFileSync(join(root, '.github', 'workflows', 'ci.yml'), REAL);
+    for (const n of NAMES) {
+      writeFileSync(join(root, '.github', 'workflows', n), FILES[n] ?? '');
+    }
     writeFileSync(join(root, '.github', 'workflows', 'sub', 'x.yml'), REAL);
     assert.ok(checkWorkflows(root).some((f) => f.rule === 'W1'), 'a nested workflow file');
   } finally {
@@ -238,30 +256,196 @@ test('SC-U2-2 the set of workflow files is exactly ci.yml', () => {
 test('SC-U2-2 the canonical text and the checker hold no SHA or version literal', () => {
   const checker = readFileSync(join(ROOT, 'src', 'workflows.ts'), 'utf8');
   assert.equal(/[0-9a-f]{40}/.test(checker), false);
-  assert.equal(/# v\d/.test(CANONICAL_CI), false);
-  assert.ok(CANONICAL_CI.includes('@<sha> # <version>'));
+  assert.deepEqual(Object.keys(CANONICAL), NAMES);
+  for (const text of Object.values(CANONICAL)) {
+    assert.equal(/# v\d/.test(text), false);
+  }
+  assert.ok(CANONICAL['ci.yml']?.includes('@<sha> # <version>'));
   assert.equal(/[0-9a-f]{40}/.test(readFileSync(new URL(import.meta.url), 'utf8')), false);
 });
 
-test('SC-U2-2 a uses line is read whole: a junk prefix, a missing dash or a tab indent is still a finding', () => {
-  const checkout = usesLine('actions/checkout');
-  const sha = (checkout.match(/@([0-9a-f]{40})/) ?? [])[1] ?? '';
-  // The junk prefix must not vanish when the line is normalised.
-  for (const prefix of ['x', '#', 'run: echo ']) {
-    const rules = mutant((t) => t.replace(checkout, `${prefix}${checkout}`));
-    assert.ok(rules.includes('W4'), `prefix ${JSON.stringify(prefix)}: ${JSON.stringify(rules)}`);
+// Commit B: the four automation workflows (SC-U2-42 to SC-U2-47).
+
+/** The line of `name` that pins `action`. */
+function pinLine(name: string, action: string): string {
+  const line = (FILES[name] ?? '').split('\n').find((l) => l.includes(`uses: ${action}@`));
+  assert.ok(line !== undefined, `${name} pins ${action}`);
+  return line;
+}
+
+/** A checkout step as the real files write it, for planting into another job. */
+const CHECKOUT_STEP = `      - uses: ${pinLine('ci.yml', 'actions/checkout').trim().replace(/^- uses: /, '')}\n        with:\n          persist-credentials: false\n`;
+const SETUP_NODE_STEP = `      - uses: ${pinLine('ci.yml', 'actions/setup-node').trim().replace(/^- uses: /, '')}\n        with:\n          node-version-file: .nvmrc\n`;
+
+/** Applies `transform` to the step whose first line is `      - id: <id>`, up to the next step. */
+function inStep(id: string, transform: (step: string) => string): (text: string) => string {
+  return (text) => {
+    const start = text.indexOf(`      - id: ${id}\n`);
+    assert.ok(start >= 0, `step ${id}`);
+    const rest = text.slice(start + 1);
+    const next = rest.search(/\n {6}- |\n\n|\n {2}[a-z]/);
+    const end = next < 0 ? text.length : start + 1 + next + 1;
+    const step = text.slice(start, end);
+    const changed = transform(step);
+    assert.notEqual(changed, step, `step ${id} unchanged`);
+    return text.slice(0, start) + changed + text.slice(end);
+  };
+}
+
+const VALIDATE_START = '      - name: Validate the decision\n';
+
+/** Moves merge's validation step after its first mint step. */
+function validationAfterMint(text: string): string {
+  const a = text.indexOf(VALIDATE_START);
+  const b = text.indexOf('      - id: contents-token\n');
+  const c = text.indexOf('      - id: workflows-token\n');
+  assert.ok(a >= 0 && a < b && b < c);
+  return text.slice(0, a) + text.slice(b, c) + text.slice(a, b) + text.slice(c);
+}
+
+function releaseValidationAfterMint(text: string): string {
+  const a = text.indexOf('      - name: Validate the inputs\n');
+  const b = text.indexOf('      - id: token\n');
+  const c = text.indexOf('      - name: Create the release\n');
+  assert.ok(a >= 0 && a < b && b < c);
+  return text.slice(0, a) + text.slice(b, c) + text.slice(a, b) + text.slice(c);
+}
+
+type Case = readonly [name: string, file: string, transform: (text: string) => string, rule: string];
+
+const DM = 'dependabot-merge.yml';
+const LB = 'labels.yml';
+const CR = 'cut-release.yml';
+const SC = 'settings-check.yml';
+
+const CASES: readonly Case[] = [
+  // SC-U2-43 (a) to (d): dependabot-merge.yml.
+  ['dependabot-merge on pull_request', DM, sub('  workflow_run:\n    workflows: [CI]\n    types: [completed]\n', '  pull_request:\n'), 'W4'],
+  ['dependabot-merge on pull_request_target', DM, sub('  workflow_run:\n    workflows: [CI]\n    types: [completed]\n', '  pull_request_target:\n'), 'W8'],
+  ['workflows: [Other]', DM, sub('workflows: [CI]', 'workflows: [Other]'), 'W4'],
+  ['types: [requested]', DM, sub('types: [completed]', 'types: [requested]'), 'W4'],
+  ['decide with contents: write', DM, sub('      contents: read\n      pull-requests: read\n', '      contents: write\n      pull-requests: read\n'), 'W9'],
+  ['decide with pull-requests: write', DM, sub('      pull-requests: read\n', '      pull-requests: write\n'), 'W4'],
+  ['decide without the conclusion condition', DM, sub("      github.event.workflow_run.conclusion == 'success' &&\n", ''), 'W4'],
+  ['decide without the event condition', DM, sub("      github.event.workflow_run.event == 'pull_request' &&\n", ''), 'W4'],
+  ['decide without the path condition', DM, sub("      github.event.workflow_run.path == '.github/workflows/ci.yml' &&\n", ''), 'W4'],
+  ['decide without the head repository condition', DM, sub(" &&\n      github.event.workflow_run.head_repository.full_name == 'ircx-io/ircx-docs'", ''), 'W4'],
+  ['decide checks out the head SHA', DM, sub('          persist-credentials: false\n', '          ref: ${{ github.event.workflow_run.head_sha }}\n          persist-credentials: false\n'), 'W4'],
+  ['decide checkout without persist-credentials', DM, sub('        with:\n          persist-credentials: false\n', ''), 'W4'],
+  ['merge without needs: decide', DM, sub('    needs: decide\n', ''), 'W4'],
+  ['merge without its if', DM, sub("    if: needs.decide.outputs.merge == 'true'\n", ''), 'W4'],
+  ['skip-token-revoke: true on a merge mint', DM, inStep('contents-token', (t) => `${t}          skip-token-revoke: true\n`), 'W11'],
+  ['a merge mint without permission-contents', DM, inStep('contents-token', (t) => t.replace('          permission-contents: write\n', '')), 'W11'],
+  ['permission-workflows on the workflows == false mint', DM, inStep('contents-token', (t) => `${t}          permission-workflows: write\n`), 'W4'],
+  ['the workflows == true mint removed', DM, inStep('workflows-token', () => ''), 'W4'],
+  ['the workflows == true mint without its if', DM, inStep('workflows-token', (t) => t.replace("        if: needs.decide.outputs.workflows == 'true'\n", '')), 'W4'],
+  ["the contents-only mint on workflows != 'true'", DM, sub("if: needs.decide.outputs.workflows == 'false'", "if: needs.decide.outputs.workflows != 'true'"), 'W4'],
+  ['merge_method=merge', DM, sub('merge_method=squash', 'merge_method=merge'), 'W4'],
+  ['the sha guard dropped', DM, sub(' -f sha=$SHA', ''), 'W4'],
+  ['a non-2xx response is ignored', DM, sub('-f sha=$SHA\n', '-f sha=$SHA || true\n'), 'W4'],
+  ['a failed merge is retried', DM, (t) => sub('        run: gh api -X PUT', '        run: for i in 1 2 3; do gh api -X PUT')(t).replace('-f sha=$SHA\n', '-f sha=$SHA && break; done\n'), 'W4'],
+  ['a concurrency group', DM, sub('permissions: {}\n\njobs:', 'permissions: {}\n\nconcurrency:\n  group: merge\n\njobs:'), 'W4'],
+  ['github.actor in an if', DM, sub("    if: needs.decide.outputs.merge == 'true'\n", "    if: needs.decide.outputs.merge == 'true' && github.actor == 'dependabot[bot]'\n"), 'W12'],
+  // SC-U2-42 (b): a key job runs no repository code.
+  ['a checkout step in merge', DM, sub(`    steps:\n${VALIDATE_START}`, `    steps:\n${CHECKOUT_STEP}${VALIDATE_START}`), 'W10'],
+  ['a checkout step in read', SC, sub('    steps:\n      - id: token\n', `    steps:\n${CHECKOUT_STEP}      - id: token\n`), 'W10'],
+  ['a setup-node step in release', CR, sub('    steps:\n      - name: Validate the inputs\n', `    steps:\n${SETUP_NODE_STEP}      - name: Validate the inputs\n`), 'W10'],
+  ['node src/dependabot.ts in merge', DM, sub('      - name: Squash-merge at the checked head\n', '      - run: node src/dependabot.ts x\n      - name: Squash-merge at the checked head\n'), 'W10'],
+  ['bash .github/x.sh in read', SC, sub('      - id: read\n', '      - run: bash .github/x.sh\n      - id: read\n'), 'W10'],
+  ['environment moved from merge to decide', DM, (t) => sub('    environment: ircx-bot\n', '')(t).replace('    timeout-minutes: 10\n    permissions:\n      contents: read\n', '    timeout-minutes: 10\n    environment: ircx-bot\n    permissions:\n      contents: read\n'), 'W10'],
+  ['environment moved from merge to decide (W7)', DM, (t) => sub('    environment: ircx-bot\n', '')(t).replace('    timeout-minutes: 10\n    permissions:\n      contents: read\n', '    timeout-minutes: 10\n    environment: ircx-bot\n    permissions:\n      contents: read\n'), 'W7'],
+  ['a decide output read directly in merge', DM, sub('-f sha=$SHA', '-f sha=${{ needs.decide.outputs.sha }}'), 'W5'],
+  // SC-U2-42 (c): the key job re-validates every value before any mint.
+  ['the number check removed', DM, (t) => t.replace(/ {10}\[\[ "\$NUMBER".*\n/, ''), 'W4'],
+  ['the sha check removed', DM, (t) => t.replace(/ {10}\[\[ "\$SHA".*\n/, ''), 'W4'],
+  ['the workflows check removed', DM, (t) => t.replace(/ {10}\[\[ "\$WORKFLOWS".*\n/, ''), 'W4'],
+  ['the workflows pattern without its end anchor', DM, sub('^(true|false)$ ]]', '^(true|false) ]]'), 'W4'],
+  ['the validation step after the first mint', DM, validationAfterMint, 'W4'],
+  // SC-U2-44: labels.yml.
+  ['labels on pull_request', LB, sub('  pull_request_target:\n', '  pull_request:\n'), 'W4'],
+  ['a checkout step in labels', LB, sub('    steps:\n', `    steps:\n${CHECKOUT_STEP}`), 'W8'],
+  ['secrets.GITHUB_TOKEN in labels', LB, sub('GH_TOKEN: ${{ github.token }}', 'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}'), 'W6'],
+  ['environment: ircx-bot in labels', LB, sub('    timeout-minutes: 5\n', '    timeout-minutes: 5\n    environment: ircx-bot\n'), 'W7'],
+  ['labels with contents: write', LB, sub('      pull-requests: write\n', '      pull-requests: write\n      contents: write\n'), 'W9'],
+  ['labels with issues: write', LB, sub('      pull-requests: write\n', '      pull-requests: write\n      issues: write\n'), 'W4'],
+  ['the pull request title in run', LB, sub('          set -uo pipefail\n', '          set -uo pipefail\n          echo "${{ github.event.pull_request.title }}"\n'), 'W5'],
+  ['the head repository in run', LB, sub('          set -uo pipefail\n', '          set -uo pipefail\n          echo "${{ github.event.pull_request.head.repo.full_name }}"\n'), 'W5'],
+  // SC-U2-45: cut-release.yml.
+  ['cut-release on push', CR, sub('on:\n  workflow_dispatch:\n', 'on:\n  push:\n  workflow_dispatch:\n'), 'W4'],
+  ['cut-release on schedule', CR, sub('on:\n  workflow_dispatch:\n', "on:\n  schedule:\n    - cron: '0 0 * * *'\n  workflow_dispatch:\n"), 'W4'],
+  ['cut-release without its environment', CR, sub('    environment: ircx-bot\n', ''), 'W7'],
+  ['the release validation after the mint', CR, releaseValidationAfterMint, 'W4'],
+  ['the tag pattern loosened', CR, (t) => t.replace(/\^v\[0-9\]\{4\}.*?\?\$ \]\]/, '^v.*$ ]]'), 'W4'],
+  ['the compare check removed', CR, (t) => t.replace(/ {10}status=.*\n {10}case "\$status" in\n.*\n.*\n {10}esac\n/, ''), 'W4'],
+  ['the 404 check replaced by || true', CR, (t) => t.replace(/ {10}if lookup=[\s\S]*? {10}esac\n {6}- id: token/, '          gh api "repos/ircx-io/ircx-docs/git/ref/tags/$TAG" || true\n      - id: token'), 'W4'],
+  ['generate_release_notes=false', CR, sub('generate_release_notes=true', 'generate_release_notes=false'), 'W4'],
+  ['target_commitish dropped', CR, sub(' -f "target_commitish=$REVISION"', ''), 'W4'],
+  ['inputs.tag inside run', CR, sub('-f "tag_name=$TAG"', '-f "tag_name=${{ inputs.tag }}"'), 'W5'],
+  ['a checkout step in release', CR, sub('    steps:\n', `    steps:\n${CHECKOUT_STEP}`), 'W10'],
+  // SC-U2-46: settings-check.yml.
+  ['compare without issues: write', SC, sub('      issues: write\n', ''), 'W4'],
+  ['read with issues: write', SC, sub('      actions: read\n      contents: read\n', '      actions: read\n      contents: read\n      issues: write\n'), 'W4'],
+  ['permission-administration: write', SC, sub('permission-administration: read', 'permission-administration: write'), 'W11'],
+  ['read without its environment', SC, sub('    environment: ircx-bot\n', ''), 'W7'],
+  ['environment: ircx-bot on compare', SC, sub('    if: always()\n', '    if: always()\n    environment: ircx-bot\n'), 'W7'],
+  ['environment: ircx-bot on compare (W10)', SC, sub('    if: always()\n', '    if: always()\n    environment: ircx-bot\n'), 'W10'],
+  ['compare without if: always()', SC, sub('    if: always()\n', ''), 'W4'],
+  ['the issue step without its failure condition', SC, sub("        if: failure() && steps.compare.outcome == 'failure'\n", ''), 'W4'],
+  ['a read output inside run', SC, sub(`printf '%s' "$RULESETS"`, `printf '%s' '\${{ needs.read.outputs.rulesets }}'`), 'W5'],
+  // SC-U2-47: one mutant per rule.
+  ['W6 secrets.IRCX_BOT_PRIVATE_KEY in labels', LB, sub('GH_TOKEN: ${{ github.token }}', 'GH_TOKEN: ${{ secrets.IRCX_BOT_PRIVATE_KEY }}'), 'W6'],
+  ['W6 toJSON(secrets) in cut-release', CR, sub('REVISION: ${{ inputs.revision }}\n        run: |', 'REVISION: ${{ inputs.revision }}\n          ALL: ${{ toJSON(secrets) }}\n        run: |'), 'W6'],
+  ['W6 the private-key line in a run step env', CR, sub('          TAG: ${{ inputs.tag }}\n          REVISION: ${{ inputs.revision }}\n        run: gh', '          TAG: ${{ inputs.tag }}\n          REVISION: ${{ inputs.revision }}\n          private-key: ${{ secrets.IRCX_BOT_PRIVATE_KEY }}\n        run: gh'), 'W6'],
+  ['W6 secrets: inherit', CR, sub('    timeout-minutes: 10\n', '    timeout-minutes: 10\n    secrets: inherit\n'), 'W6'],
+  ['W7 environment: ircx-bot in ci.yml', 'ci.yml', sub('    timeout-minutes: 15\n', '    timeout-minutes: 15\n    environment: ircx-bot\n'), 'W7'],
+  ['W7 environment: other in settings-check', SC, sub('    environment: ircx-bot\n', '    environment: other\n'), 'W7'],
+  ['W8 pull_request_target in ci.yml', 'ci.yml', sub('  pull_request:\n', '  pull_request:\n  pull_request_target:\n'), 'W8'],
+  ['W8 a uses line in labels', LB, sub('      - name: Label', `      - uses: ${pinLine('ci.yml', 'actions/checkout').trim().replace(/^- uses: /, '')}\n      - name: Label`), 'W8'],
+  ['W9 permissions: write-all in cut-release', CR, sub('permissions: {}\n', 'permissions: write-all\n'), 'W9'],
+  ['W9 id-token: write in dependabot-merge', DM, sub('      pull-requests: read\n', '      pull-requests: read\n      id-token: write\n'), 'W9'],
+  ['W11 skip-token-revoke in cut-release', CR, inStep('token', (t) => `${t}          skip-token-revoke: true\n`), 'W11'],
+  ['W11 repositories removed', CR, inStep('token', (t) => t.replace('          repositories: ircx-docs\n', '')), 'W11'],
+  ['W11 every permission input removed from one mint', CR, inStep('token', (t) => t.replace(/ {10}permission-.*\n/g, '')), 'W11'],
+  ['W11 a client-id from an expression', CR, inStep('token', (t) => t.replace(/client-id: \S+/, 'client-id: ${{ vars.CLIENT_ID }}')), 'W11'],
+  ['W11 permission-secrets: write in settings-check', SC, sub('permission-secrets: read', 'permission-secrets: write'), 'W11'],
+  ['W12 set -x in a run block', LB, sub('          set -uo pipefail\n', '          set -x\n          set -uo pipefail\n'), 'W12'],
+  ['W12 GH_DEBUG in an env', LB, sub('          PR: ', '          GH_DEBUG: api\n          PR: '), 'W12'],
+  ['W13 name: CI in labels', LB, sub('name: Labels\n', 'name: CI\n'), 'W13'],
+];
+
+test('SC-U2-42 to SC-U2-47 the canonical automation workflows pass', () => {
+  for (const name of NAMES) {
+    assert.ok((FILES[name] ?? '').length > 0, name);
   }
-  assert.ok(normalise('f', `x${checkout}\n`, new Map()).text.startsWith('x'), 'the prefix survives normalisation');
-  assert.deepEqual(normalise('f', `# ${checkout.trim()}\n`, new Map()).findings, [], 'a comment is not a uses line');
-  const cases: Array<[string, string]> = [
-    ['a tag pin without the dash', '        uses: actions/checkout@v7'],
-    ['a local action without the dash', '        uses: ./.github/actions/x'],
-    ['a tab-indented tag pin', '\t- uses: actions/checkout@v7'],
-    ['a tab-indented docker action', '\t\tuses: docker://alpine'],
-    ['an unlisted action without the dash', `        uses: dependabot/fetch-metadata@${sha} # v2.0.0`],
-  ];
-  for (const [name, line] of cases) {
-    const rules = mutant((t) => t.replace(checkout, line));
-    assert.ok(rules.includes('W2'), `${name}: ${JSON.stringify(rules)}`);
+  assert.deepEqual(check({ ...FILES }), []);
+});
+
+test('SC-U2-42 to SC-U2-47 each requirement has a failing mutant under its rule id', () => {
+  const names = new Set<string>();
+  for (const [name, file, transform, rule] of CASES) {
+    assert.ok(!names.has(name), `duplicate case ${name}`);
+    names.add(name);
+    const rules = mutantIn(file, transform);
+    assert.ok(rules.includes(rule), `${name}: expected ${rule}, got ${JSON.stringify(rules)}`);
+    // Every mutant also differs from the canonical text, so no change slips past the compare.
+    assert.ok(rules.includes('W4'), `${name}: expected W4 too`);
   }
+  // Every structural rule is exercised by at least one mutant.
+  const exercised = new Set(CASES.map((c) => c[3]));
+  for (const rule of ['W4', 'W5', 'W6', 'W7', 'W8', 'W9', 'W10', 'W11', 'W12', 'W13']) {
+    assert.ok(exercised.has(rule), rule);
+  }
+});
+
+test('SC-U2-47 the structural rules hold on the real files without the canonical compare', () => {
+  for (const name of NAMES) {
+    assert.deepEqual(structuralFindings(name, FILES[name] ?? ''), [], name);
+  }
+});
+
+test('SC-U2-2 two SHAs for the App token action across files is a W3 finding', () => {
+  const line = pinLine(SC, 'actions/create-github-app-token');
+  const sha = (/@([0-9a-f]{40})/.exec(line) ?? [])[1] ?? '';
+  const rules = mutantIn(SC, (t) => t.replace(sha, otherSha(sha)));
+  assert.ok(rules.includes('W3'), JSON.stringify(rules));
 });

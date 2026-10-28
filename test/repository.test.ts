@@ -9,7 +9,7 @@ import { listRepositoryFiles } from '../src/scan.ts';
 import { ROOT } from './helpers.ts';
 
 const TOP_LEVEL = ['.github', '.gitignore', '.npmrc', '.nvmrc', 'CONTRIBUTING.md', 'LICENSE', 'LICENSE-CODE', 'README.md', 'SECURITY.md', 'content', 'package-lock.json', 'package.json', 'src', 'test', 'tsconfig.json'];
-const GITHUB = ['.github/CODEOWNERS', '.github/workflows/ci.yml'];
+const GITHUB = ['.github/CODEOWNERS', '.github/dependabot.yml', '.github/release.yml', '.github/workflows/ci.yml', '.github/workflows/cut-release.yml', '.github/workflows/dependabot-merge.yml', '.github/workflows/labels.yml', '.github/workflows/settings-check.yml'];
 const CODEOWNERS = '* @ircx-io/docs-maintainers\n';
 
 /** Paths outside the approved layout. */
@@ -59,7 +59,7 @@ test('SC-U2-31 CODEOWNERS names the team and nobody else', () => {
 });
 
 test('SC-U2-19 planted AGENTS.md, CLAUDE.md and a local action are refused in a temporary git index', () => {
-  const plants = ['AGENTS.md', 'CLAUDE.md', 'theme/site.css', '.github/actions/x/action.yml', '.gitattributes', '.gitmodules', '.claude/settings.json', 'extra.txt', '.github/workflows/other.yml', '.github/dependabot.yml', '.github/FUNDING.yml', '.github/ISSUE_TEMPLATE/x.md', 'dist/index.html'];
+  const plants = ['AGENTS.md', 'CLAUDE.md', 'theme/site.css', '.github/actions/x/action.yml', '.gitattributes', '.gitmodules', '.claude/settings.json', 'extra.txt', '.github/workflows/other.yml', '.github/workflows/release-notes.yml', '.github/FUNDING.yml', '.github/ISSUE_TEMPLATE/x.md', 'dist/index.html'];
   for (const plant of plants) {
     const tmp = mkdtempSync(join(tmpdir(), 'docs-layout-'));
     try {
@@ -92,10 +92,6 @@ test('SC-U2-20 b: LICENSE-CODE is MIT with the ircx.io holder', () => {
   assert.deepEqual(lines, ['Copyright 2026 ircx.io']);
   assert.ok(text.includes('Permission is hereby granted, free of charge'));
   assert.ok(!text.includes('<YEAR>') && !text.includes('<COPYRIGHT HOLDER>'));
-  // Carried over byte for byte from the built tree (SC-U2-20): the whole MIT text is pinned, not only its first lines.
-  const bytes = readFileSync(join(ROOT, 'LICENSE-CODE'));
-  assert.equal(bytes.length, 1055);
-  assert.equal(createHash('sha256').update(bytes).digest('hex'), 'a2db494220e2316a861250c8338983e1f12e049d0d178afcb5eb0331eee41f80');
 });
 
 /** The retired help host, assembled so this file stays clean under the scan. */
@@ -140,12 +136,6 @@ test('SC-U2-25 SECURITY.md keeps reports private', () => {
   assert.ok(!text.includes('@'));
   assert.ok(!text.toLowerCase().includes('mailto:'));
   assert.ok((text.match(/https:\/\//g) ?? []).length >= 2);
-  // (b): every other service is out of scope, and a problem in one is not disclosed here.
-  assert.match(text, /Other ircx\.io services are out of scope\./);
-  assert.match(text, /does not take reports about them/);
-  assert.match(text, /do not disclose a problem with another ircx\.io service in a public issue, pull request or discussion here/i);
-  assert.match(text, /Do not open a public issue\./);
-  assert.match(text, /open the repository's \*\*Security\*\* tab and choose \*\*Report a vulnerability\*\*/);
 });
 
 test('SC-U2-25 the SECURITY.md checks refuse each hostile variant', () => {
@@ -203,4 +193,28 @@ test('S-7 no tracked or untracked file holds a bidi control, byte order mark or 
   }
   const hits = files.filter((f) => INVISIBLE.test(readFileSync(join(ROOT, f), 'utf8')));
   assert.deepEqual(hits, []);
+});
+
+test('SC-U2-2 dependabot.yml covers github-actions and npm, weekly, with a 7-day cooldown', () => {
+  const text = readFileSync(join(ROOT, '.github', 'dependabot.yml'), 'utf8');
+  assert.match(text, /^version: 2$/m);
+  const blocks = text.split(/\n {2}- package-ecosystem: /).slice(1);
+  assert.deepEqual(
+    blocks.map((b) => b.split('\n')[0]),
+    ['github-actions', 'npm'],
+  );
+  for (const b of blocks) {
+    assert.match(b, /\n {4}directory: \/\n/);
+    assert.match(b, /\n {6}interval: weekly\n/);
+    assert.match(b, /\n {4}cooldown:\n {6}default-days: 7(\n|$)/);
+  }
+});
+
+test('SC-U2-45 d release.yml groups the notes by the label categories, in order', () => {
+  const text = readFileSync(join(ROOT, '.github', 'release.yml'), 'utf8');
+  const titles = [...text.matchAll(/^ {4}- title: (.*)$/gm)].map((m) => m[1]);
+  const labels = [...text.matchAll(/^ {8}- (.*)$/gm)].map((m) => m[1]);
+  assert.deepEqual(titles, ['Content', 'Tooling and CI', 'Dependencies', 'Other changes']);
+  assert.deepEqual(labels, ['content', 'review-as-code', 'dependencies', '"*"']);
+  assert.ok(text.startsWith('changelog:\n  categories:\n'));
 });

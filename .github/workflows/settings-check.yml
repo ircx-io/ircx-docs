@@ -1,0 +1,165 @@
+name: Settings check
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ircx-bot
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      repository: ${{ steps.read.outputs.repository }}
+      actions-permissions: ${{ steps.read.outputs.actions-permissions }}
+      selected-actions: ${{ steps.read.outputs.selected-actions }}
+      workflow-permissions: ${{ steps.read.outputs.workflow-permissions }}
+      fork-pr-approval: ${{ steps.read.outputs.fork-pr-approval }}
+      vulnerability-alerts: ${{ steps.read.outputs.vulnerability-alerts }}
+      private-vulnerability-reporting: ${{ steps.read.outputs.private-vulnerability-reporting }}
+      rulesets: ${{ steps.read.outputs.rulesets }}
+      actions-secrets: ${{ steps.read.outputs.actions-secrets }}
+      dependabot-secrets: ${{ steps.read.outputs.dependabot-secrets }}
+      environment-secrets: ${{ steps.read.outputs.environment-secrets }}
+      environment-variables: ${{ steps.read.outputs.environment-variables }}
+      environments: ${{ steps.read.outputs.environments }}
+      branch-policies: ${{ steps.read.outputs.branch-policies }}
+      releases: ${{ steps.read.outputs.releases }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: Iv23liAz4GUkls9I3nc2
+          private-key: ${{ secrets.IRCX_BOT_PRIVATE_KEY }}
+          owner: ircx-io
+          repositories: ircx-docs
+          permission-administration: read
+          permission-secrets: read
+          permission-dependabot-secrets: read
+          permission-environments: read
+      - id: read
+        env:
+          APP_TOKEN: ${{ steps.token.outputs.token }}
+          JOB_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          repo=repos/ircx-io/ircx-docs
+          record() {
+            printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+          }
+          with_app() {
+            local value
+            if value="$(GH_TOKEN="$APP_TOKEN" gh api "$2" | jq -c .)"; then record "$1" "$value"; else record "$1" ""; fi
+          }
+          with_job() {
+            local value
+            if value="$(GH_TOKEN="$JOB_TOKEN" gh api --paginate "$2" | jq -c -s .)"; then record "$1" "$value"; else record "$1" ""; fi
+          }
+          with_app repository "$repo"
+          with_app actions-permissions "$repo/actions/permissions"
+          with_app selected-actions "$repo/actions/permissions/selected-actions"
+          with_app workflow-permissions "$repo/actions/permissions/workflow"
+          with_app fork-pr-approval "$repo/actions/permissions/fork-pr-contributor-approval"
+          with_app private-vulnerability-reporting "$repo/private-vulnerability-reporting"
+          with_app actions-secrets "$repo/actions/secrets"
+          with_app dependabot-secrets "$repo/dependabot/secrets"
+          with_app environment-secrets "$repo/environments/ircx-bot/secrets"
+          with_app environment-variables "$repo/environments/ircx-bot/variables"
+          if alerts="$(GH_TOKEN="$APP_TOKEN" gh api "$repo/vulnerability-alerts" 2>&1)"; then
+            record vulnerability-alerts '{"enabled":true}'
+          else
+            case "$alerts" in
+              *"(HTTP 404)"*) record vulnerability-alerts '{"enabled":false}' ;;
+              *) record vulnerability-alerts "" ;;
+            esac
+          fi
+          rulesets=""
+          if ids="$(GH_TOKEN="$APP_TOKEN" gh api "$repo/rulesets" --jq '.[].id')"; then
+            rulesets="[]"
+            for id in $ids; do
+              [[ "$id" =~ ^[0-9]{1,12}$ ]] || { rulesets=""; break; }
+              one="$(GH_TOKEN="$APP_TOKEN" gh api "$repo/rulesets/$id" | jq -c .)" || { rulesets=""; break; }
+              rulesets="$(jq -c --argjson one "$one" '. + [$one]' <<< "$rulesets")" || { rulesets=""; break; }
+            done
+          fi
+          record rulesets "$rulesets"
+          with_job environments "$repo/environments"
+          with_job branch-policies "$repo/environments/ircx-bot/deployment-branch-policies"
+          with_job releases "$repo/releases"
+
+  compare:
+    needs: read
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Write the responses to files
+        env:
+          REPOSITORY: ${{ needs.read.outputs.repository }}
+          ACTIONS_PERMISSIONS: ${{ needs.read.outputs.actions-permissions }}
+          SELECTED_ACTIONS: ${{ needs.read.outputs.selected-actions }}
+          WORKFLOW_PERMISSIONS: ${{ needs.read.outputs.workflow-permissions }}
+          FORK_PR_APPROVAL: ${{ needs.read.outputs.fork-pr-approval }}
+          VULNERABILITY_ALERTS: ${{ needs.read.outputs.vulnerability-alerts }}
+          PRIVATE_VULNERABILITY_REPORTING: ${{ needs.read.outputs.private-vulnerability-reporting }}
+          RULESETS: ${{ needs.read.outputs.rulesets }}
+          ACTIONS_SECRETS: ${{ needs.read.outputs.actions-secrets }}
+          DEPENDABOT_SECRETS: ${{ needs.read.outputs.dependabot-secrets }}
+          ENVIRONMENT_SECRETS: ${{ needs.read.outputs.environment-secrets }}
+          ENVIRONMENT_VARIABLES: ${{ needs.read.outputs.environment-variables }}
+          ENVIRONMENTS: ${{ needs.read.outputs.environments }}
+          BRANCH_POLICIES: ${{ needs.read.outputs.branch-policies }}
+          RELEASES: ${{ needs.read.outputs.releases }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/settings"
+          mkdir -p "$dir"
+          printf '%s' "$REPOSITORY" > "$dir/repository.json"
+          printf '%s' "$ACTIONS_PERMISSIONS" > "$dir/actions-permissions.json"
+          printf '%s' "$SELECTED_ACTIONS" > "$dir/selected-actions.json"
+          printf '%s' "$WORKFLOW_PERMISSIONS" > "$dir/workflow-permissions.json"
+          printf '%s' "$FORK_PR_APPROVAL" > "$dir/fork-pr-approval.json"
+          printf '%s' "$VULNERABILITY_ALERTS" > "$dir/vulnerability-alerts.json"
+          printf '%s' "$PRIVATE_VULNERABILITY_REPORTING" > "$dir/private-vulnerability-reporting.json"
+          printf '%s' "$RULESETS" > "$dir/rulesets.json"
+          printf '%s' "$ACTIONS_SECRETS" > "$dir/actions-secrets.json"
+          printf '%s' "$DEPENDABOT_SECRETS" > "$dir/dependabot-secrets.json"
+          printf '%s' "$ENVIRONMENT_SECRETS" > "$dir/environment-secrets.json"
+          printf '%s' "$ENVIRONMENT_VARIABLES" > "$dir/environment-variables.json"
+          printf '%s' "$ENVIRONMENTS" > "$dir/environments.json"
+          printf '%s' "$BRANCH_POLICIES" > "$dir/branch-policies.json"
+          printf '%s' "$RELEASES" > "$dir/releases.json"
+      - id: compare
+        run: |
+          set -o pipefail
+          node src/settings.ts "$RUNNER_TEMP/settings" | tee "$RUNNER_TEMP/findings.txt"
+      - name: Report the drift in an issue
+        if: failure() && steps.compare.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body="$(printf 'The weekly settings check found drift.\n\nFindings:\n\n%s\n\nRun: %s\n' "$(cat "$RUNNER_TEMP/findings.txt")" "$run_url")"
+          number="$(gh api "repos/ircx-io/ircx-docs/issues?state=open&labels=settings-drift" --jq '[.[] | select(.user.login == "github-actions[bot]" and (.pull_request | not))][0].number // ""')"
+          if [[ "$number" =~ ^[1-9][0-9]{0,9}$ ]]; then
+            gh api -X POST "repos/ircx-io/ircx-docs/issues/$number/comments" -f "body=$body" > /dev/null
+          else
+            gh api -X POST repos/ircx-io/ircx-docs/issues -f "title=Weekly settings check found drift" -f "body=$body" -f "labels[]=settings-drift" > /dev/null
+          fi

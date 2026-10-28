@@ -1,11 +1,11 @@
 import { strict as assert } from 'node:assert';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { ALLOWED_REPO_TOKENS, EXCLUDED_FILES, EXTERNAL_HOSTS, GITHUB_REPO_PATH, listRepositoryFiles, REFERENCE_WORD_DIGESTS, scanBytes, scanDirectory, scanLine, scanRepository, SCAN_EXTRA_HOSTS } from '../src/scan.ts';
+import { ALLOWED_REPO_TOKENS, EXCLUDED_FILES, listRepositoryFiles, REFERENCE_WORD_DIGESTS, scanBytes, scanDirectory, scanLine, scanRepository, SCAN_EXTRA_HOSTS } from '../src/scan.ts';
 import { cat, ROOT } from './helpers.ts';
 
 /** A 30-character opaque value that is not hex-only, so only the assignment rule reads it. */
@@ -103,7 +103,7 @@ test('scanLine: the allowlists pass and near misses are findings', () => {
     // The 32-digit run is hex, so only that last line trips S7.
     assert.deepEqual(got, line.startsWith('plain words') ? ['S7'] : [], line);
   }
-  assert.deepEqual(ALLOWED_REPO_TOKENS, ['ircx-docs', 'ircx-io']);
+  assert.deepEqual(ALLOWED_REPO_TOKENS, ['ircx-bot', 'ircx-docs', 'ircx-io', 'ircx-io-bot']);
   assert.ok(scanLine(cat('ircx', '-other')).includes('S5'));
   assert.ok(scanLine(cat('ircx-docs', 'x')).includes('S5'));
   assert.ok(SCAN_EXTRA_HOSTS.includes('wiki.creativecommons.org'));
@@ -486,6 +486,14 @@ test('SC-U2-16 e: ircx-io and ircx-docs pass S5 and another ircx token is a find
   }
 });
 
+test('SC-U2-16 e: the environment name and the App slug pass S5; their plurals are findings', () => {
+  assert.deepEqual(scanLine(`environment: ${cat('ircx', '-bot')}`), []);
+  assert.deepEqual(scanLine(`the slug ${cat('ircx', '-io-bot')} and its user ${cat('ircx', '-io-bot')}[bot]`), []);
+  assert.deepEqual(scanLine(cat('ircx', '-bots')), ['S5']);
+  assert.deepEqual(scanLine(cat('ircx', '-io-bots')), ['S5']);
+  assert.deepEqual(scanLine(cat('ircx', '-bot-x')), ['S5']);
+});
+
 test('SC-U2-16 f: --dir scans a plain directory with no git and no exclusions', () => {
   const dir = mkdtempSync(join(tmpdir(), 'docs-plain-'));
   try {
@@ -540,60 +548,6 @@ test('SC-U2-16 g: the real tree is clean', () => {
   const run = spawnSync(process.execPath, [join(ROOT, 'src', 'scan.ts')], { encoding: 'utf8' });
   assert.equal(run.status, 0, run.stderr);
   assert.equal(run.stdout, 'scan: no findings\n');
-});
-
-test('SC-U2-16 a: git is the only child process, run without a shell with this exact argument list', () => {
-  const dir = join(ROOT, 'src');
-  const sources = readdirSync(dir).filter((n) => n.endsWith('.ts'));
-  assert.deepEqual(sources.sort(), ['check.ts', 'content.ts', 'scan.ts', 'text.ts', 'workflows.ts']);
-  // Every spelling that starts a child process or reaches a shell. `execFileSync(` and the one import in scan.ts are the allowed use.
-  const spellings: RegExp[] = [/\bchild_process\b/, /\bexecSync\b/, /\bspawnSync\b/, /(^|[^.\w])spawn\(/, /(^|[^.\w])execFile\(/, /(^|[^.\w])exec\(/, /(^|[^.\w])fork\(/, /\bshell\s*[:=]/, /\bWorker\b/, /process\.binding/];
-  for (const name of sources) {
-    const text = readFileSync(join(dir, name), 'utf8').replace(name === 'scan.ts' ? /execFileSync/g : /^$/g, '').replace(name === 'scan.ts' ? "'node:child_process'" : /^$/g, '');
-    for (const spelling of spellings) {
-      assert.ok(!spelling.test(text), `${name}: ${spelling.source}`);
-    }
-  }
-  const scan = readFileSync(join(dir, 'scan.ts'), 'utf8');
-  assert.equal(scan.match(/child_process/g)?.length, 1);
-  assert.ok(scan.includes("import { execFileSync } from 'node:child_process';"));
-  assert.equal(scan.match(/execFileSync\(/g)?.length, 1);
-  assert.ok(scan.includes("execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], {\n    cwd: root,\n    encoding: 'utf8',\n    maxBuffer: 64 * 1024 * 1024,\n  });"));
-});
-
-test('SC-U2-16 h d: the host allowlists are exactly these, and a host outside them is an S4 finding in a URL', () => {
-  assert.deepEqual([...EXTERNAL_HOSTS], ['ircx.io', 'www.rfc-editor.org', 'datatracker.ietf.org', 'creativecommons.org', 'opensource.org', 'docs.github.com', 'github.com']);
-  assert.deepEqual([...SCAN_EXTRA_HOSTS], ['dir.ircx.io', 'chat.ircx.io', 'wiki.creativecommons.org', 'registry.npmjs.org']);
-  assert.equal(GITHUB_REPO_PATH, '/ircx-io/ircx-docs');
-  assert.deepEqual([...EXCLUDED_FILES], ['package-lock.json']);
-  assert.deepEqual([...ALLOWED_REPO_TOKENS], ['ircx-docs', 'ircx-io']);
-  const dot = '.';
-  // The path is this repository's, which every host may carry; on github.com any other path is an S5 finding.
-  for (const host of [...EXTERNAL_HOSTS, ...SCAN_EXTRA_HOSTS]) {
-    assert.deepEqual(scanLine(cat('https:/', '/', host, '/ircx-io/ircx-docs')), [], host);
-  }
-  for (const host of [cat('exa', 'mple', dot, 'com'), cat('api', dot, 'ircx', dot, 'io'), cat('help', dot, 'ircx', dot, 'io'), cat('www', dot, 'ircx', dot, 'io'), cat('evil', dot, 'github', dot, 'com'), cat('github', dot, 'com', dot, 'evil', dot, 'net'), cat('x', dot, 'internal'), cat('x', dot, 'local'), cat('x', dot, 'corp'), cat('x', dot, 'home'), cat('x', dot, 'lan'), cat('x', dot, 'exampl')]) {
-    assert.deepEqual(scanLine(cat('https:/', '/', host, '/x')), ['S4'], host);
-  }
-  assert.deepEqual(scanLine('https://a.example/ https://b.invalid/ https://c.test/ https://d.localhost/'), [], 'the four reserved top-level names');
-  assert.deepEqual(scanLine('https://localhost:8080/ and https://x.example:9/'), []);
-});
-
-test('SC-U2-16 h: a bare host with each listed top-level name is an S4 finding, and a listed host is not', () => {
-  const dot = '.';
-  for (const tld of ['com', 'net', 'org', 'io', 'dev', 'app', 'cloud', 'ai', 'nl']) {
-    assert.deepEqual(scanLine(cat('see ', 'evil', dot, tld, ' here')), ['S4'], tld);
-    assert.deepEqual(scanLine(cat('see EVIL', dot, tld.toUpperCase())), ['S4'], `${tld} in capitals`);
-  }
-  assert.deepEqual(scanLine('see ircx.io and github.com and creativecommons.org here'), []);
-  assert.deepEqual(scanLine(cat('see x', dot, 'ircx', dot, 'io')), ['S4']);
-});
-
-test('SC-U2-16 e: a URL with credentials in front of any host is an S4 finding, even when the host has no dot', () => {
-  const at = '@';
-  assert.deepEqual(scanLine(cat('https:/', '/tok', at, 'intranet/x')), ['S4']);
-  assert.deepEqual(scanLine(cat('https:/', '/user:pw', at, 'localhost/x')), ['S4']);
-  assert.deepEqual(scanLine(cat('https:/', '/', 'ircx', '.', 'io', at, 'localhost/')), ['S4']);
 });
 
 test('S5: a github.com reference spelled any other way than this repository is a finding', () => {

@@ -1,0 +1,61 @@
+name: Cut release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, vYYYY.MM.DD in UTC, with .2 to .9 appended for a later release the same day
+        required: true
+        type: string
+      revision:
+        description: The full commit SHA of the revision the frontend pins
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ircx-bot
+    permissions:
+      contents: read
+    steps:
+      - name: Validate the inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[2-9])?$ ]] || { echo "the tag must be vYYYY.MM.DD, optionally followed by .2 to .9"; exit 1; }
+          [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "the revision must be a full lowercase commit SHA"; exit 1; }
+          status="$(gh api "repos/ircx-io/ircx-docs/compare/$REVISION...main" --jq .status)"
+          case "$status" in
+            ahead | identical) ;;
+            *) echo "the revision is not on main"; exit 1 ;;
+          esac
+          if lookup="$(gh api "repos/ircx-io/ircx-docs/git/ref/tags/$TAG" 2>&1)"; then
+            echo "the tag already exists"
+            exit 1
+          fi
+          case "$lookup" in
+            *"(HTTP 404)"*) ;;
+            *) echo "the tag lookup failed"; exit 1 ;;
+          esac
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: Iv23liAz4GUkls9I3nc2
+          private-key: ${{ secrets.IRCX_BOT_PRIVATE_KEY }}
+          owner: ircx-io
+          repositories: ircx-docs
+          permission-contents: write
+          permission-workflows: write
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          TAG: ${{ inputs.tag }}
+          REVISION: ${{ inputs.revision }}
+        run: gh api -X POST repos/ircx-io/ircx-docs/releases -f "tag_name=$TAG" -f "target_commitish=$REVISION" -F generate_release_notes=true -f make_latest=true -F draft=false > /dev/null

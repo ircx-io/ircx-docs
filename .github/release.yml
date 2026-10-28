@@ -1,0 +1,14 @@
+changelog:
+  categories:
+    - title: Content
+      labels:
+        - content
+    - title: Tooling and CI
+      labels:
+        - review-as-code
+    - title: Dependencies
+      labels:
+        - dependencies
+    - title: Other changes
+      labels:
+        - "*"

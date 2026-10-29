@@ -303,6 +303,46 @@ function validationAfterMint(text: string): string {
   return text.slice(0, a) + text.slice(b, c) + text.slice(a, b) + text.slice(c);
 }
 
+/** Moves settings-check's merge-token and merge-options steps before its read step. */
+function mergeStepsBeforeRead(text: string): string {
+  const a = text.indexOf('      - id: read\n');
+  const b = text.indexOf('      - id: merge-token\n');
+  const c = text.indexOf('\n\n  compare:\n') + 1;
+  assert.ok(a >= 0 && a < b && b < c);
+  return text.slice(0, a) + text.slice(b, c) + text.slice(a, b) + text.slice(c);
+}
+
+/** Swaps settings-check's merge-token and merge-options steps, so merge-options comes first. */
+function mergeStepsSwapped(text: string): string {
+  const b = text.indexOf('      - id: merge-token\n');
+  const c = text.indexOf('      - id: merge-options\n');
+  const d = text.indexOf('\n\n  compare:\n') + 1;
+  assert.ok(b >= 0 && b < c && c < d);
+  return text.slice(0, b) + text.slice(c, d) + text.slice(b, c) + text.slice(d);
+}
+
+/** The merge-token step as the real file writes it, for planting into the compare job. */
+function mergeTokenStep(text: string): string {
+  const b = text.indexOf('      - id: merge-token\n');
+  const c = text.indexOf('      - id: merge-options\n');
+  assert.ok(b >= 0 && b < c);
+  return text.slice(b, c);
+}
+
+/** Moves settings-check's read mint, the step `token`, into the compare job. */
+function readMintInCompare(text: string): string {
+  const a = text.indexOf('      - id: token\n');
+  const b = text.indexOf('      - id: read\n');
+  const c = text.indexOf('      - name: Write the responses to files\n');
+  assert.ok(a >= 0 && a < b && b < c);
+  return text.slice(0, a) + text.slice(b, c) + text.slice(a, b) + text.slice(c);
+}
+
+/** Appends `line` to the shell of settings-check's merge-options step. */
+function mergeOptionsLine(line: string): (text: string) => string {
+  return inStep('merge-options', (t) => `${t}          ${line}\n`);
+}
+
 function releaseValidationAfterMint(text: string): string {
   const a = text.indexOf('      - name: Validate the inputs\n');
   const b = text.indexOf('      - id: token\n');
@@ -392,6 +432,41 @@ const CASES: readonly Case[] = [
   ['compare without if: always()', SC, sub('    if: always()\n', ''), 'W4'],
   ['the issue step without its failure condition', SC, sub("        if: failure() && steps.compare.outcome == 'failure'\n", ''), 'W4'],
   ['a read output inside run', SC, sub(`printf '%s' "$RULESETS"`, `printf '%s' '\${{ needs.read.outputs.rulesets }}'`), 'W5'],
+  // SC-U2-46 a and b, SC-U2-47 W11 and W14: the Contents-write mint and the merge-options read.
+  ['permission-contents: write on the read mint', SC, inStep('token', (t) => t.replace('          permission-environments: read\n', '          permission-environments: read\n          permission-contents: write\n')), 'W11'],
+  ['skip-token-revoke on merge-token', SC, inStep('merge-token', (t) => `${t}          skip-token-revoke: true\n`), 'W11'],
+  ['merge-token renamed', SC, sub('      - id: merge-token\n', '      - id: other\n'), 'W11'],
+  ['permission-administration: read added to merge-token', SC, inStep('merge-token', (t) => `${t}          permission-administration: read\n`), 'W14'],
+  ['permission-workflows: write added to merge-token', SC, inStep('merge-token', (t) => `${t}          permission-workflows: write\n`), 'W14'],
+  ['permission-workflows: write in place of permission-contents on merge-token', SC, inStep('merge-token', (t) => t.replace('permission-contents: write', 'permission-workflows: write')), 'W14'],
+  ['the read mint moved to compare', SC, readMintInCompare, 'W14'],
+  ['a third mint in read', SC, (t) => sub('      - id: read\n', `${mergeTokenStep(t).replace('id: merge-token', 'id: extra').replace('permission-contents: write', 'permission-secrets: read')}      - id: read\n`)(t), 'W14'],
+  ['the read step renamed', SC, sub('      - id: read\n', '      - id: other\n'), 'W14'],
+  ['a mint step in compare', SC, (t) => sub('      - name: Write the responses to files\n', `${mergeTokenStep(t)}      - name: Write the responses to files\n`)(t), 'W14'],
+  ['merge-token and merge-options moved before the read step', SC, mergeStepsBeforeRead, 'W14'],
+  ['a step after merge-options', SC, sub('\n\n  compare:\n', '\n      - run: true\n\n  compare:\n'), 'W14'],
+  ['the merge-field filter without allow_auto_merge', SC, sub(' allow_auto_merge,', ''), 'W4'],
+  ['merge-options read through the read mint', SC, sub('GH_TOKEN: ${{ steps.merge-token.outputs.token }}', 'GH_TOKEN: ${{ steps.token.outputs.token }}'), 'W14'],
+  ['a merge-token output on read', SC, sub('      merge-options: ${{ steps.merge-options.outputs.merge-options }}\n', '      merge-options: ${{ steps.merge-options.outputs.merge-options }}\n      merge-token: ${{ steps.merge-token.outputs.token }}\n'), 'W14'],
+  ['merge-token in the read step env', SC, sub('APP_TOKEN: ${{ steps.token.outputs.token }}', 'APP_TOKEN: ${{ steps.merge-token.outputs.token }}'), 'W14'],
+  ['merge-token under another env key', SC, inStep('merge-options', (t) => t.replace('GH_TOKEN: ${{', 'TOKEN: ${{').replace('$(gh api', '$(GH_TOKEN="$TOKEN" gh api')), 'W14'],
+  ['GH_TOKEN renamed on merge-options', SC, sub('          GH_TOKEN: ${{ steps.merge-token.outputs.token }}\n', '          TOKEN: ${{ steps.merge-token.outputs.token }}\n'), 'W14'],
+  ['a second env key on merge-options', SC, sub('          GH_TOKEN: ${{ steps.merge-token.outputs.token }}\n', '          GH_TOKEN: ${{ steps.merge-token.outputs.token }}\n          X: y\n'), 'W14'],
+  ['a PATCH on the repository', SC, sub('gh api repos/ircx-io/ircx-docs |', 'gh api -X PATCH repos/ircx-io/ircx-docs -F allow_auto_merge=true |'), 'W14'],
+  ['a field flag on the read', SC, sub('gh api repos/ircx-io/ircx-docs |', 'gh api -f name=x repos/ircx-io/ircx-docs |'), 'W14'],
+  ['another endpoint in merge-options', SC, sub('gh api repos/ircx-io/ircx-docs |', 'gh api repos/ircx-io/ircx-docs/hooks |'), 'W14'],
+  ['a second gh call in merge-options', SC, mergeOptionsLine('gh api repos/ircx-io/ircx-docs/collaborators > /dev/null'), 'W14'],
+  ['declare in merge-options', SC, mergeOptionsLine('declare -p > /dev/null'), 'W14'],
+  ['env as a command in merge-options', SC, mergeOptionsLine('env | sort > /dev/null'), 'W14'],
+  ['a second output in merge-options', SC, mergeOptionsLine(`printf 'other=1\\n' >> "$GITHUB_OUTPUT"`), 'W14'],
+  ['a graphql call in merge-options', SC, mergeOptionsLine('gh api graphql -f query=x'), 'W14'],
+  ['the token written to an output', SC, mergeOptionsLine(`printf 'token=%s\\n' "$GH_TOKEN" >> "$GITHUB_OUTPUT"`), 'W14'],
+  ['a GITHUB_ENV write in merge-options', SC, mergeOptionsLine('echo x=y >> "$GITHUB_ENV"'), 'W14'],
+  ['printenv into the step summary', SC, mergeOptionsLine('printenv >> "$GITHUB_STEP_SUMMARY"'), 'W14'],
+  ['merge-options before merge-token', SC, mergeStepsSwapped, 'W14'],
+  ['a step between merge-token and merge-options', SC, sub('      - id: merge-options\n', '      - run: true\n      - id: merge-options\n'), 'W14'],
+  ['repositories removed from merge-token', SC, inStep('merge-token', (t) => t.replace('          repositories: ircx-docs\n', '')), 'W11'],
+  ['owner removed from merge-token', SC, inStep('merge-token', (t) => t.replace('          owner: ircx-io\n', '')), 'W11'],
   // SC-U2-47: one mutant per rule.
   ['W6 secrets.IRCX_BOT_PRIVATE_KEY in labels', LB, sub('GH_TOKEN: ${{ github.token }}', 'GH_TOKEN: ${{ secrets.IRCX_BOT_PRIVATE_KEY }}'), 'W6'],
   ['W6 toJSON(secrets) in cut-release', CR, sub('REVISION: ${{ inputs.revision }}\n        run: |', 'REVISION: ${{ inputs.revision }}\n          ALL: ${{ toJSON(secrets) }}\n        run: |'), 'W6'],
@@ -432,7 +507,7 @@ test('SC-U2-42 to SC-U2-47 each requirement has a failing mutant under its rule 
   }
   // Every structural rule is exercised by at least one mutant.
   const exercised = new Set(CASES.map((c) => c[3]));
-  for (const rule of ['W4', 'W5', 'W6', 'W7', 'W8', 'W9', 'W10', 'W11', 'W12', 'W13']) {
+  for (const rule of ['W4', 'W5', 'W6', 'W7', 'W8', 'W9', 'W10', 'W11', 'W12', 'W13', 'W14']) {
     assert.ok(exercised.has(rule), rule);
   }
 });
@@ -448,4 +523,314 @@ test('SC-U2-2 two SHAs for the App token action across files is a W3 finding', (
   const sha = (/@([0-9a-f]{40})/.exec(line) ?? [])[1] ?? '';
   const rules = mutantIn(SC, (t) => t.replace(sha, otherSha(sha)));
   assert.ok(rules.includes('W3'), JSON.stringify(rules));
+});
+
+const CANONICAL_RUN_FINDING = 'the merge-options step needs its run text to be exactly the lines of its canonical form';
+const OPTIONS_STEP_FINDING = 'the merge-options step is exactly its canonical lines';
+const READ_JOB_FINDING = 'job read is exactly its canonical lines, its uses: pins aside';
+
+/** Every W14 message `settings-check.yml` gets when `line` is added to the merge-options shell. */
+function allMergeOptionsMessages(line: string): string[] {
+  const text = mergeOptionsLine(line)(FILES[SC] ?? '');
+  return structuralFindings(SC, text)
+    .filter((f) => f.rule === 'W14')
+    .map((f) => f.message);
+}
+
+/**
+ * The W14 messages for an added line, without the three canonical-form messages
+ * that every added line gets, so each other clause of (d) is tested on its own.
+ */
+function mergeOptionsMessages(line: string): string[] {
+  return allMergeOptionsMessages(line).filter((m) => m !== CANONICAL_RUN_FINDING && m !== OPTIONS_STEP_FINDING && m !== READ_JOB_FINDING);
+}
+
+/**
+ * Each forbidden string of SC-U2-47 W14 (d) and each file command name, alone on
+ * a line of the merge-options shell. The line holds no other forbidden string and
+ * no gh or env command word, so the one message names the string.
+ */
+const FORBIDDEN_ALONE: readonly (readonly [word: string, line: string])[] = [
+  ['-X', ': -X'],
+  ['--method', ': --method'],
+  ['-f', ': -f x'],
+  ['-F', ': -F x'],
+  ['--field', ': --field'],
+  ['--raw-field', ': --raw-field'],
+  ['--input', ': --input'],
+  ['--paginate', ': --paginate'],
+  ['graphql', ': graphql'],
+  ['GH_TOKEN', ': GH_TOKEN'],
+  ['printenv', ': printenv'],
+  ['declare', ': declare'],
+  ['export', ': export'],
+  ['/proc/', ': /proc/self/status'],
+  ['GITHUB_ENV', ': GITHUB_ENV'],
+  ['GITHUB_PATH', ': GITHUB_PATH'],
+  ['GITHUB_STEP_SUMMARY', ': GITHUB_STEP_SUMMARY'],
+  ['GITHUB_STATE', ': GITHUB_STATE'],
+];
+
+test('SC-U2-47 W14 d each forbidden string and file command name alone is its own finding', () => {
+  assert.deepEqual(mergeOptionsMessages(': true'), []);
+  assert.equal(new Set(FORBIDDEN_ALONE.map((c) => c[0])).size, 18);
+  for (const [word, line] of FORBIDDEN_ALONE) {
+    assert.deepEqual(mergeOptionsMessages(line), [`the merge-options step needs no ${word}`], word);
+  }
+});
+
+const GH_FINDING = 'the merge-options step needs exactly one gh command, gh api repos/ircx-io/ircx-docs into a pipe';
+const ENV_FINDING = 'the merge-options step needs no env command';
+
+test('SC-U2-47 W14 d a gh or env command word after a semicolon, an ampersand, a pipe or a parenthesis is found', () => {
+  // No whitespace before the word, so the separator character alone puts it at a command position.
+  for (const sep of [';', '&', '|', '(']) {
+    assert.deepEqual(mergeOptionsMessages(`true${sep}gh api x`), [GH_FINDING], `gh after ${sep}`);
+    assert.deepEqual(mergeOptionsMessages(`true${sep}env `), [ENV_FINDING], `env after ${sep}`);
+  }
+});
+
+test('SC-U2-47 W14 d a command word ending at a shell terminator or inside backticks is found', () => {
+  // Each line holds one gh or env command word, and the SA text counts every one.
+  const lines: readonly (readonly [line: string, finding: string])[] = [
+    ['x=`gh api repos/ircx-io/ircx-docs/hooks`', GH_FINDING],
+    ['x=$(env)', ENV_FINDING],
+    ['env|sort', ENV_FINDING],
+    [' env;', ENV_FINDING],
+    [' env&', ENV_FINDING],
+    ['{ env; }', ENV_FINDING],
+    ['x=`env`', ENV_FINDING],
+    ['x=`env `', ENV_FINDING],
+    [`printf 'merge-options=%s\\n' "$(env)" >> "$GITHUB_OUTPUT"`, ENV_FINDING],
+  ];
+  const missed = lines.filter(([line, finding]) => !mergeOptionsMessages(line).includes(finding)).map(([line]) => line);
+  assert.deepEqual(missed, []);
+});
+
+const SET_FINDING = 'the merge-options step needs no set without an option';
+const OUTPUT_FINDING = `the merge-options step needs GITHUB_OUTPUT written only by printf 'merge-options=%s\\n' "$value" >> "$GITHUB_OUTPUT"`;
+
+test('SC-U2-47 W14 d gh, env and bare set are found after every shell boundary and before every one', () => {
+  const before = [' ', ';', '&', '|', '(', '{', '`', '"', "'", '\\', '/'];
+  const after = ['', ' ', ';', '&', '|', ')', '}', '`', '"', "'", '<', '>'];
+  for (const b of before) {
+    assert.deepEqual(mergeOptionsMessages(`true${b}gh x`), [GH_FINDING], `gh after ${b}`);
+    assert.deepEqual(mergeOptionsMessages(`true${b}env x`), [ENV_FINDING], `env after ${b}`);
+    assert.deepEqual(mergeOptionsMessages(`true${b}set`), [SET_FINDING], `set after ${b}`);
+  }
+  for (const a of after) {
+    assert.deepEqual(mergeOptionsMessages(`true;gh${a}`), [GH_FINDING], `gh before ${JSON.stringify(a)}`);
+    assert.deepEqual(mergeOptionsMessages(`true;env${a}`), [ENV_FINDING], `env before ${JSON.stringify(a)}`);
+    assert.deepEqual(mergeOptionsMessages(`true;set${a}`), [SET_FINDING], `set before ${JSON.stringify(a)}`);
+  }
+  assert.deepEqual(mergeOptionsMessages('/usr/bin/env | sort'), [ENV_FINDING]);
+  assert.deepEqual(mergeOptionsMessages('x="$(/usr/bin/printenv)"'), ['the merge-options step needs no printenv']);
+  assert.deepEqual(mergeOptionsMessages('set > /dev/null'), [SET_FINDING]);
+  // Near misses: the name inside a longer word, a variable, an assignment, or set with an option.
+  for (const line of [': environment', ': $env', 'x=env', ': gh-pages', ': ghx', ': offset', ': settings', 'set -e', 'set +o pipefail']) {
+    assert.deepEqual(mergeOptionsMessages(line), [], line);
+  }
+});
+
+test('SC-U2-47 W14 d a second command on the merge-options output line is found', () => {
+  assert.deepEqual(mergeOptionsMessages(`printf 'merge-options=%s\\n' "$value" >> "$GITHUB_OUTPUT"; printf 'other=1\\n' >> "$GITHUB_OUTPUT"`), [OUTPUT_FINDING]);
+  assert.deepEqual(mergeOptionsMessages(`printf 'merge-options=%s\\n' "$value" >> "$GITHUB_OUTPUT"`), []);
+});
+
+test('SC-U2-47 W14 d spellings that hide env or write GITHUB_OUTPUT another way are each found', () => {
+  // Spellings no word clause matches: only the canonical-lines clause finds them.
+  for (const line of [`$'\\x65nv'`, 'e""nv', 'n=GH_TO; n+=KEN; echo "${!n}"', 'eval "$(printf \'e\\x6ev\')"', 'd\\eclare -p', 'compgen -v']) {
+    assert.deepEqual(allMergeOptionsMessages(line), [CANONICAL_RUN_FINDING, OPTIONS_STEP_FINDING, READ_JOB_FINDING], line);
+  }
+  // A heredoc around a command substitution is an env command word and a changed run text.
+  assert.deepEqual(allMergeOptionsMessages('cat <<EOF\n          $(env)\n          EOF'), [ENV_FINDING, CANONICAL_RUN_FINDING, OPTIONS_STEP_FINDING, READ_JOB_FINDING]);
+  // Another writer of GITHUB_OUTPUT, spelled quoted, bare or braced, is the output clause.
+  for (const line of ['echo x | tee -a "$GITHUB_OUTPUT"', 'echo x | tee -a $GITHUB_OUTPUT', 'echo x >> ${GITHUB_OUTPUT}']) {
+    assert.deepEqual(mergeOptionsMessages(line), [OUTPUT_FINDING], line);
+  }
+  // The canonical printf line replaced by a tee breaks the output clause and the canonical-lines clause.
+  const replaced = sub(`          printf 'merge-options=%s\\n' "$value" >> "$GITHUB_OUTPUT"\n`, `          printf 'merge-options=%s\\n' "$value" | tee -a "$GITHUB_OUTPUT"\n`)(FILES[SC] ?? '');
+  assert.deepEqual(
+    structuralFindings(SC, replaced)
+      .filter((f) => f.rule === 'W14')
+      .map((f) => f.message),
+    [OUTPUT_FINDING, CANONICAL_RUN_FINDING, OPTIONS_STEP_FINDING, READ_JOB_FINDING],
+  );
+  // A step key outside the run text breaks the whole-step and whole-job clauses, as well as the canonical compare W4.
+  const shellKey = sub('      - id: merge-options\n', '      - id: merge-options\n        shell: sh -c env {0}\n')(FILES[SC] ?? '');
+  assert.deepEqual(
+    structuralFindings(SC, shellKey)
+      .filter((f) => f.rule === 'W14')
+      .map((f) => f.message),
+    [OPTIONS_STEP_FINDING, READ_JOB_FINDING],
+  );
+  assert.deepEqual(check({ ...FILES, [SC]: shellKey }), ['W14', 'W14', 'W4']);
+});
+
+test('SC-U2-47 W14 d the merge-options run text is exactly its canonical lines', () => {
+  const canonical = FILES[SC] ?? '';
+  assert.deepEqual(structuralFindings(SC, canonical).filter((f) => f.rule === 'W14'), []);
+  // Lines that pass every other clause of (d): a no-op, an indirect expansion of the token, a quoted command word.
+  for (const line of [': true', 'n=GH_TO; n+=KEN; echo "${!n}"', 'e""nv | sort']) {
+    assert.deepEqual(allMergeOptionsMessages(line), [CANONICAL_RUN_FINDING, OPTIONS_STEP_FINDING, READ_JOB_FINDING], line);
+  }
+  const edits: readonly (readonly [string, string])[] = [
+    ['            value=""\n', '            value="x"\n'],
+    ['          set -uo pipefail\n', ''],
+    ['          fi\n', '          fi\n          fi\n'],
+    [`          printf 'merge-options=%s\\n' "$value" >> "$GITHUB_OUTPUT"\n`, ''],
+  ];
+  const at = canonical.indexOf('      - id: merge-options\n');
+  assert.ok(at >= 0);
+  const [head, tail] = [canonical.slice(0, at), canonical.slice(at)];
+  for (const [from, to] of edits) {
+    assert.ok(tail.includes(from), from);
+    const messages = structuralFindings(SC, head + tail.replace(from, to))
+      .filter((f) => f.rule === 'W14')
+      .map((f) => f.message);
+    assert.deepEqual(messages, [CANONICAL_RUN_FINDING, OPTIONS_STEP_FINDING, READ_JOB_FINDING], JSON.stringify(from));
+  }
+});
+
+test('SC-U2-47 W10 node, npm, npx, bash and sh are found after a backtick, a brace, a quote or a path', () => {
+  const w10 = (line: string): boolean =>
+    structuralFindings(SC, sub('      - id: read\n', `      - run: ${line}\n      - id: read\n`)(FILES[SC] ?? '')).some(
+      (f) => f.rule === 'W10' && f.message === 'job read runs repository code or a script',
+    );
+  assert.equal(w10('true'), false);
+  for (const line of ['x=`node x`', 'true;{ npm x; }', '"npx" x', "true;'node' x", '/usr/bin/node x', 'true\\npm x', 'x=`bash x`', '/bin/sh x', 'true;{ . x; }', 'x=`. x`']) {
+    assert.equal(w10(line), true, line);
+  }
+});
+
+test('SC-U2-42 b W10 a source command at the start of an indented shell line is found', () => {
+  const inRead = (line: string): string[] =>
+    structuralFindings(SC, sub('          with_job releases "$repo/releases"\n', `          with_job releases "$repo/releases"\n          ${line}\n`)(FILES[SC] ?? ''))
+      .filter((f) => f.rule === 'W10')
+      .map((f) => f.message);
+  for (const line of ['. /tmp/x', 'x=1; . /tmp/x']) {
+    assert.deepEqual(inRead(line), ['job read runs repository code or a script'], line);
+  }
+  // A dot that is an argument, not a command: find's start directory, echo and printf.
+  for (const line of ['find . -name x', 'echo .', 'printf . > /tmp/y']) {
+    assert.deepEqual(inRead(line), [], line);
+  }
+});
+
+/** The W14 messages for settings-check.yml after `transform`. */
+function w14(transform: (text: string) => string): string[] {
+  return structuralFindings(SC, transform(FILES[SC] ?? ''))
+    .filter((f) => f.rule === 'W14')
+    .map((f) => f.message);
+}
+
+const STEPS_FINDING = 'every steps reference has the form steps.<id>.outputs.<name> or steps.<id>.outcome';
+const COUNT_FINDING = 'merge-token is named on exactly two lines: - id: merge-token and GH_TOKEN: ${{ steps.merge-token.outputs.token }}';
+const MINT_STEP_FINDING = 'the merge-token step is exactly its canonical lines, its uses: pin aside';
+const DEFAULTS_FINDING = 'no defaults: key';
+const ENV_KEY_FINDING = 'no env: key at workflow or job level';
+const FILE_COMMAND_FINDING = 'no GITHUB_ENV or GITHUB_PATH in job read';
+
+/** Adds `leak` as a job output of read, which job compare can read. */
+function readOutput(leak: string): (text: string) => string {
+  const at = '      merge-options: ${{ steps.merge-options.outputs.merge-options }}\n';
+  return sub(at, `${at}      leak: \${{ ${leak} }}\n`);
+}
+
+test('SC-U2-47 W14 c every steps reference names one step output or outcome', () => {
+  assert.deepEqual(w14((t) => t), []);
+  // Index, wildcard and whole-context forms reach the token without the text steps.merge-token.outputs.
+  for (const leak of ['toJSON(steps)', "steps['merge-token'].outputs.token", 'steps["merge-token"].outputs.token', "steps.merge-token['outputs'].token", "steps.merge-token.outputs['token']", 'join(steps.*.outputs.token)', 'toJSON(steps.merge-token)', 'toJSON(steps.merge-token.outputs)', 'STEPS.read.outputs.repository']) {
+    assert.ok(w14(readOutput(leak)).includes(STEPS_FINDING), leak);
+  }
+  // Anything after the output name: an index, a property, a wildcard, or a name that goes on past the lowercase form.
+  for (const leak of ["steps.read.outputs.repository['x']", 'steps.read.outputs.repository.x', 'steps.read.outputs.repository.*', 'steps.read.outputs.rEpository', 'steps.read.outputs.re_pository']) {
+    assert.ok(w14(readOutput(leak)).includes(STEPS_FINDING), leak);
+  }
+  // Near misses: a named output and an outcome, as the real file writes them, and steps inside a longer name.
+  // Each is a new line of job read, so only the whole-job clause finds it.
+  for (const leak of ['steps.read.outputs.repository', "steps.compare.outcome == 'failure'", 'steps.read.outputs.release-steps', 'steps.read.outputs.stepsx']) {
+    assert.deepEqual(w14(readOutput(leak)), [READ_JOB_FINDING], leak);
+  }
+});
+
+test('SC-U2-47 W14 c merge-token is named on exactly two lines', () => {
+  assert.deepEqual(w14(sub('      - name: Write the responses to files\n', '      # merge-token\n      - name: Write the responses to files\n')), [COUNT_FINDING]);
+  // Another case is a third line, though the case-sensitive count of steps.merge-token.outputs misses it.
+  assert.deepEqual(w14(readOutput('steps.MERGE-TOKEN.outputs.token')), [STEPS_FINDING, COUNT_FINDING, READ_JOB_FINDING]);
+  assert.ok(w14(readOutput('toJSON(steps.merge-token)')).includes(COUNT_FINDING));
+});
+
+const MINT_COUNT_FINDING = 'exactly two App token steps, both in job read';
+
+test('SC-U2-47 W14 a mint in a job other than read is a finding when the count is still two', () => {
+  assert.ok(!w14((t) => t).includes(MINT_COUNT_FINDING));
+  // The read mint moves to compare, so there are two mints in all and only the job differs.
+  assert.ok(w14(readMintInCompare).includes(MINT_COUNT_FINDING));
+});
+
+test('SC-U2-47 W14 no defaults: key and no env: at workflow or job level', () => {
+  const shell = "shell: bash -c 'env >&2; bash {0}' {0}\n";
+  const jobAt = '    timeout-minutes: 10\n    environment: ircx-bot\n';
+  assert.deepEqual(w14(sub('\njobs:\n', `\ndefaults:\n  run:\n    ${shell}\njobs:\n`)), [DEFAULTS_FINDING]);
+  assert.deepEqual(w14(sub(jobAt, `${jobAt}    defaults:\n      run:\n        ${shell}`)), [DEFAULTS_FINDING, READ_JOB_FINDING]);
+  assert.deepEqual(w14(sub('\njobs:\n', '\nenv:\n  BASH_ENV: /tmp/x\n\njobs:\n')), [ENV_KEY_FINDING]);
+  assert.deepEqual(w14(sub(jobAt, `${jobAt}    env:\n      BASH_ENV: /tmp/x\n`)), [ENV_KEY_FINDING, READ_JOB_FINDING]);
+});
+
+test('SC-U2-47 W14 no step of read writes GITHUB_ENV or GITHUB_PATH', () => {
+  const at = '          with_job releases "$repo/releases"\n';
+  for (const line of [`printf 'BASH_ENV=/tmp/x\\n' >> "$GITHUB_ENV"`, 'echo /tmp/b >> "$GITHUB_PATH"']) {
+    assert.deepEqual(w14(sub(at, `${at}          ${line}\n`)), [FILE_COMMAND_FINDING, READ_JOB_FINDING], line);
+  }
+  assert.ok(w14(sub('      - id: merge-token\n', '      - run: echo /tmp/b >> "$GITHUB_PATH"\n      - id: merge-token\n')).includes(FILE_COMMAND_FINDING));
+});
+
+test('SC-U2-47 W14 the merge-token and merge-options steps are each exactly their canonical lines', () => {
+  for (const key of ["shell: bash -c 'env >&2; bash {0}' {0}", 'working-directory: /tmp', 'continue-on-error: true']) {
+    assert.deepEqual(w14(sub('      - id: merge-options\n', `      - id: merge-options\n        ${key}\n`)), [OPTIONS_STEP_FINDING, READ_JOB_FINDING], key);
+  }
+  for (const input of ['github-api-url: https://e.example/api', 'enterprise: x', 'app-id: 1']) {
+    assert.deepEqual(w14(inStep('merge-token', (t) => `${t}          ${input}\n`)), [MINT_STEP_FINDING, READ_JOB_FINDING], input);
+  }
+  assert.deepEqual(w14(inStep('merge-token', (t) => t.replace('client-id: Iv23liAz4GUkls9I3nc2', 'client-id: Iv23other'))), [MINT_STEP_FINDING, READ_JOB_FINDING]);
+  assert.deepEqual(w14(inStep('merge-token', (t) => `${t}        continue-on-error: true\n`)), [MINT_STEP_FINDING, READ_JOB_FINDING]);
+});
+
+test('SC-U2-47 W14 job read is exactly its canonical lines, its uses: pins aside', () => {
+  assert.deepEqual(w14((t) => t), []);
+  const envAt = '    environment: ircx-bot\n';
+  const readEnd = '          with_job releases "$repo/releases"\n';
+  // Job keys and shell in the step read that no named-spelling clause of W14 finds.
+  const edits: readonly (readonly [name: string, edit: (text: string) => string])[] = [
+    ['a job container', sub(envAt, `${envAt}    container: e.example/img:1\n`)],
+    ['a self-hosted runner', sub('  read:\n    runs-on: ubuntu-latest\n', '  read:\n    runs-on: [self-hosted]\n')],
+    ['a background reader of /proc', sub(readEnd, `${readEnd}          ( cat /proc/[0-9]*/environ > /tmp/e ) &\n`)],
+    ['an env file named by indirect expansion', sub(readEnd, `${readEnd}          n=GITHUB_E; n+=NV\n          echo 'BASH_ENV=/tmp/x' >> "\${!n}"\n`)],
+    ['a replaced jq', sub(readEnd, `${readEnd}          sudo install -m 755 /tmp/j /usr/bin/jq\n`)],
+    ['a gh config file', sub(readEnd, `${readEnd}          printf 'http_unix_socket: /tmp/s\\n' > ~/.config/gh/config.yml\n`)],
+    ['a job env as a complex key', sub(envAt, `${envAt}    ? env\n    : {BASH_ENV: /tmp/x}\n`)],
+    ['a container as a flow map', sub(envAt, `${envAt}    container: {image: e.example/img:1, env: {BASH_ENV: /tmp/x}}\n`)],
+  ];
+  for (const [name, edit] of edits) {
+    assert.deepEqual(w14(edit), [READ_JOB_FINDING], name);
+  }
+  // Near misses: a SHA and version bump of either App token uses: line, and an edit to job compare alone.
+  for (const n of [0, 1]) {
+    let k = 0;
+    const bump = (text: string): string =>
+      text.replace(USES, (line, indent: string, dash: string | undefined, action: string, sha: string) =>
+        action === 'actions/create-github-app-token' && k++ === n ? `${indent}${dash ?? ''}uses: ${action}@${otherSha(sha)} # v9.8.7` : line,
+      );
+    assert.notEqual(bump(FILES[SC] ?? ''), FILES[SC]);
+    assert.equal(k, 2);
+    k = 0;
+    assert.deepEqual(w14(bump), [], `App token uses: line ${n}`);
+  }
+  assert.deepEqual(w14(sub('    if: always()\n', '    if: success() || failure()\n')), []);
+});
+
+test('SC-U2-47 W14 a workflow without a job named read is also a job read finding', () => {
+  // Renamed, the job is not found, so the whole-job clause compares an empty job and fails on its own account.
+  assert.ok(w14(sub('  read:\n    runs-on', '  reed:\n    runs-on')).includes(READ_JOB_FINDING));
 });

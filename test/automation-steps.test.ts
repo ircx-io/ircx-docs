@@ -290,20 +290,16 @@ const SC = workflow('settings-check.yml');
 const READ_SETTINGS = runOf(stepNamed(jobOf(SC, 'read'), 'read'));
 const WRITE_RESPONSES = runOf(stepNamed(jobOf(SC, 'compare'), 'Write the responses to files'));
 const REPORT_DRIFT = runOf(stepNamed(jobOf(SC, 'compare'), 'Report the drift in an issue'));
-const APP = { actor_id: 5512599, actor_type: 'Integration', bypass_mode: 'always' };
+const MERGE_OPTIONS = runOf(stepNamed(jobOf(SC, 'read'), 'merge-options'));
 
-function rs(id: number, name: string, target: string, include: string, rules: unknown[], bypass: unknown[]): unknown {
-  return { id, name, target, enforcement: 'active', conditions: { ref_name: { include: [include], exclude: [] } }, rules, bypass_actors: bypass };
+/** A ruleset as the read token gets it: GitHub leaves out `bypass_actors` for a token that cannot write the ruleset. */
+function rs(id: number, name: string, target: string, include: string, rules: unknown[]): unknown {
+  return { id, name, target, enforcement: 'active', conditions: { ref_name: { include: [include], exclude: [] } }, rules };
 }
 
-/** What GitHub answers, endpoint by endpoint, when every setting is as it was set up. */
+/** What the read token gets, endpoint by endpoint, when every setting is as it was set up; `GET /repos` carries no merge fields for it. */
 const RAW: Record<string, string> = {
   [REPO]: JSON.stringify({
-    allow_squash_merge: true,
-    allow_merge_commit: false,
-    allow_rebase_merge: false,
-    allow_auto_merge: false,
-    delete_branch_on_merge: true,
     has_wiki: false,
     has_projects: false,
     has_issues: true,
@@ -323,10 +319,10 @@ const RAW: Record<string, string> = {
   [`${REPO}/environments/ircx-bot/deployment-branch-policies`]: '{"total_count":1,"branch_policies":[{"name":"main","type":"branch"}]}',
   [`${REPO}/releases`]: '[{"author":{"login":"ircx-io-bot[bot]"},"assets":[],"draft":false}]',
   [`${REPO}/rulesets`]: '[{"id":11},{"id":12},{"id":13},{"id":14}]',
-  [`${REPO}/rulesets/11`]: JSON.stringify(rs(11, 'main-history', 'branch', '~DEFAULT_BRANCH', [{ type: 'deletion' }, { type: 'non_fast_forward' }], [])),
-  [`${REPO}/rulesets/12`]: JSON.stringify(rs(12, 'main-checks', 'branch', '~DEFAULT_BRANCH', [{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'docs' }] } }], [APP])),
-  [`${REPO}/rulesets/13`]: JSON.stringify(rs(13, 'tags-create', 'tag', '~ALL', [{ type: 'creation' }], [APP])),
-  [`${REPO}/rulesets/14`]: JSON.stringify(rs(14, 'tags-locked', 'tag', '~ALL', [{ type: 'update' }, { type: 'deletion' }], [])),
+  [`${REPO}/rulesets/11`]: JSON.stringify(rs(11, 'main-history', 'branch', '~DEFAULT_BRANCH', [{ type: 'deletion' }, { type: 'non_fast_forward' }])),
+  [`${REPO}/rulesets/12`]: JSON.stringify(rs(12, 'main-checks', 'branch', '~DEFAULT_BRANCH', [{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'docs' }] } }])),
+  [`${REPO}/rulesets/13`]: JSON.stringify(rs(13, 'tags-create', 'tag', '~ALL', [{ type: 'creation' }])),
+  [`${REPO}/rulesets/14`]: JSON.stringify(rs(14, 'tags-locked', 'tag', '~ALL', [{ type: 'update' }, { type: 'deletion' }])),
 };
 
 /** Output name to the endpoint whose failure empties exactly that output. */
@@ -402,14 +398,38 @@ test('SC-U2-46 b with every endpoint answering, the read step writes one compact
   assert.deepEqual(rulesets.map((x) => x.name), ['main-history', 'main-checks', 'tags-create', 'tags-locked']);
 });
 
-test('SC-U2-46 b the outputs the read step writes are exactly the clean state settings.ts expects', () => {
+/** What the Contents-write token gets from `GET /repos`: the four plain fields plus the five merge fields, and no `security_and_analysis`. */
+const MERGE_RAW = JSON.stringify({ has_wiki: false, has_projects: false, has_issues: true, visibility: 'public', allow_squash_merge: true, allow_merge_commit: false, allow_rebase_merge: false, allow_auto_merge: false, delete_branch_on_merge: true });
+const MERGE_FIELDS = ['allow_auto_merge', 'allow_merge_commit', 'allow_rebase_merge', 'allow_squash_merge', 'delete_branch_on_merge'];
+
+test('SC-U2-46 b the outputs the read and merge-options steps write are exactly the clean state settings.ts expects', () => {
   const r = readSettings();
   const files: Record<string, string> = {};
   for (const [name, value] of r.outputs) {
     files[`${name}.json`] = value;
   }
+  const merge = runShell(MERGE_OPTIONS, { env: { GH_TOKEN: 'merge-token', GITHUB_OUTPUT: 'out.txt' }, files: { 'out.txt': '' }, routes: [{ match: `=api ${REPO}`, out: MERGE_RAW }] }, (x) => ({ status: x.status, out: x.read('out.txt') ?? '', calls: x.calls }));
+  assert.equal(merge.status, 0);
+  assert.deepEqual(merge.calls, [{ token: 'merge-token', args: ['api', REPO] }]);
+  assert.match(merge.out, /^merge-options=\{[^\n]*\}\n$/);
+  assert.deepEqual(Object.keys(JSON.parse(merge.out.slice('merge-options='.length, -1)) as Record<string, unknown>).sort(), MERGE_FIELDS, 'the step projects exactly the five merge fields');
+  assert.ok(!merge.out.includes('merge-token'), 'the token value is not in the output');
+  files['merge-options.json'] = merge.out.slice('merge-options='.length, -1);
   const out = runShell(`node ${join(ROOT, 'src', 'settings.ts')} .`, { files }, (x) => ({ status: x.status, stdout: x.stdout }));
   assert.deepEqual(out, { status: 0, stdout: 'settings: no drift\n' });
+});
+
+/** Runs the real merge-options shell with `GET /repos` answering `route`, and returns its status and the lines it wrote to GITHUB_OUTPUT. */
+function runMergeOptions(route: { out?: string; rc?: number; err?: string }): { status: number | null; out: string } {
+  return runShell(MERGE_OPTIONS, { env: { GH_TOKEN: 'merge-token', GITHUB_OUTPUT: 'out.txt' }, files: { 'out.txt': '' }, routes: [{ match: `=api ${REPO}`, ...route }] }, (x) => ({ status: x.status, out: x.read('out.txt') ?? '' }));
+}
+
+test('SC-U2-46 b merge-options writes an empty output when the read fails or is not JSON, and five null fields when the fields are omitted', () => {
+  assert.deepEqual(runMergeOptions({ rc: 1, err: 'gh: Server Error (HTTP 500)' }), { status: 0, out: 'merge-options=\n' });
+  assert.deepEqual(runMergeOptions({ out: 'not json' }), { status: 0, out: 'merge-options=\n' });
+  const omitted = runMergeOptions({ out: '{"has_wiki":false,"name":"leak"}' });
+  assert.equal(omitted.status, 0);
+  assert.equal(omitted.out, 'merge-options={"allow_squash_merge":null,"allow_merge_commit":null,"allow_rebase_merge":null,"allow_auto_merge":null,"delete_branch_on_merge":null}\n');
 });
 
 test('SC-U2-46 b a failed read leaves exactly that output empty and the other fourteen intact', () => {
@@ -468,14 +488,14 @@ test('SC-U2-46 b a hostile response cannot add an output line: a newline in a va
 // ---------------------------------------------------------------------------
 // SC-U2-46 b: the compare job writes the outputs to files through env only.
 
-test('SC-U2-46 b each compare env variable is written byte for byte to the file named by its output, and the files are the fifteen settings.ts reads', () => {
+test('SC-U2-46 b each compare env variable is written byte for byte to the file named by its output, and the files are the sixteen settings.ts reads', () => {
   const env = envOf(stepNamed(jobOf(SC, 'compare'), 'Write the responses to files'));
   const mapping = Object.entries(env).map(([name, value]) => {
     const m = /^\$\{\{ needs\.read\.outputs\.([a-z-]+) \}\}$/.exec(value);
     assert.ok(m !== null, `${name}: ${value}`);
     return [name, m[1] ?? ''] as const;
   });
-  assert.deepEqual(mapping.map(([, out]) => out).sort(), OUTPUT_NAMES);
+  assert.deepEqual(mapping.map(([, out]) => out).sort(), [...OUTPUT_NAMES, 'merge-options'].sort());
   const hostile = ['$(touch pwned)', '`touch pwned`', 'line1\nline2', '-n', '%s%s', "'; touch pwned; '", '', '  padded  ', '\\n'];
   mapping.forEach(([name, out], k) => {
     const value = hostile[k % hostile.length] ?? '';
@@ -488,7 +508,7 @@ test('SC-U2-46 b each compare env variable is written byte for byte to the file 
   });
 });
 
-test('SC-U2-46 b the compare step writes all fifteen files and each holds only its own variable', () => {
+test('SC-U2-46 b the compare step writes all sixteen files and each holds only its own variable', () => {
   const env = envOf(stepNamed(jobOf(SC, 'compare'), 'Write the responses to files'));
   const values = Object.fromEntries(Object.keys(env).map((name, k) => [name, `value-${k}`]));
   runShell(WRITE_RESPONSES, { env: values }, (r) => {
@@ -530,7 +550,7 @@ interface Drift {
   readonly tokens: string[];
 }
 
-function reportDrift(listing: unknown[], findings = 'rulesets: rulesets.main-checks.bypass_actors\nsettings: repository.has_issues\n'): Drift {
+function reportDrift(listing: unknown[], findings = 'settings: merge-options.allow_auto_merge\nsettings: repository.has_issues\n'): Drift {
   return runShell(
     REPORT_DRIFT,
     { env: DRIFT_ENV, files: { 'tmp/findings.txt': findings }, routes: [{ match: ISSUE_FILTER, out: JSON.stringify(listing) }, { match: '-X POST', out: '{}' }] },
@@ -550,7 +570,7 @@ test('SC-U2-46 e with no open drift issue the step opens one with the fixed titl
   assert.ok(post.includes('title=Weekly settings check found drift'));
   assert.ok(post.includes('labels[]=settings-drift'));
   const body = post.find((a) => a.startsWith('body=')) ?? '';
-  assert.ok(body.includes('rulesets: rulesets.main-checks.bypass_actors\nsettings: repository.has_issues'));
+  assert.ok(body.includes('settings: merge-options.allow_auto_merge\nsettings: repository.has_issues'));
   assert.ok(body.endsWith('Run: https://github.com/ircx-io/ircx-docs/actions/runs/987654'), JSON.stringify(body));
   assert.deepEqual(r.tokens, ['job-token', 'job-token']);
 });

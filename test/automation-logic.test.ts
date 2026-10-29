@@ -231,15 +231,15 @@ test('SC-U2-43 c the entry point fails closed: wrong argument count, a missing f
 // ---------------------------------------------------------------------------
 // SC-U2-46 c and SC-U2-3 b: settings.ts.
 
-const APP = { actor_id: 5512599, actor_type: 'Integration', bypass_mode: 'always' };
-
-function ruleset(name: string, target: string, include: string, rules: Json[], bypass: Json[]): Json {
-  return { id: 1, name, target, enforcement: 'active', conditions: { ref_name: { include: [include], exclude: [] } }, rules, bypass_actors: bypass };
+/** A ruleset as the read token gets it, without `bypass_actors`. */
+function ruleset(name: string, target: string, include: string, rules: Json[]): Json {
+  return { id: 1, name, target, enforcement: 'active', conditions: { ref_name: { include: [include], exclude: [] } }, rules };
 }
 
 function clean(): Record<string, any> {
   return {
-    repository: { allow_squash_merge: true, allow_merge_commit: false, allow_rebase_merge: false, allow_auto_merge: false, delete_branch_on_merge: true, has_wiki: false, has_projects: false, has_issues: true, visibility: 'public', security_and_analysis: { secret_scanning: { status: 'enabled' }, secret_scanning_push_protection: { status: 'enabled' } } },
+    repository: { has_wiki: false, has_projects: false, has_issues: true, visibility: 'public', security_and_analysis: { secret_scanning: { status: 'enabled' }, secret_scanning_push_protection: { status: 'enabled' } } },
+    'merge-options': { allow_squash_merge: true, allow_merge_commit: false, allow_rebase_merge: false, allow_auto_merge: false, delete_branch_on_merge: true },
     'actions-permissions': { enabled: true, allowed_actions: 'selected', sha_pinning_required: true },
     'selected-actions': { github_owned_allowed: false, verified_allowed: false, patterns_allowed: ['actions/checkout@*', 'actions/create-github-app-token@*', 'actions/setup-node@*'] },
     'workflow-permissions': { default_workflow_permissions: 'read', can_approve_pull_request_reviews: false },
@@ -247,10 +247,10 @@ function clean(): Record<string, any> {
     'vulnerability-alerts': { enabled: true },
     'private-vulnerability-reporting': { enabled: true },
     rulesets: [
-      ruleset('main-history', 'branch', '~DEFAULT_BRANCH', [{ type: 'deletion' }, { type: 'non_fast_forward' }], []),
-      ruleset('main-checks', 'branch', '~DEFAULT_BRANCH', [{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'docs' }] } }], [{ ...APP }]),
-      ruleset('tags-create', 'tag', '~ALL', [{ type: 'creation' }], [{ ...APP }]),
-      ruleset('tags-locked', 'tag', '~ALL', [{ type: 'update' }, { type: 'deletion' }], []),
+      ruleset('main-history', 'branch', '~DEFAULT_BRANCH', [{ type: 'deletion' }, { type: 'non_fast_forward' }]),
+      ruleset('main-checks', 'branch', '~DEFAULT_BRANCH', [{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'docs' }] } }]),
+      ruleset('tags-create', 'tag', '~ALL', [{ type: 'creation' }]),
+      ruleset('tags-locked', 'tag', '~ALL', [{ type: 'update' }, { type: 'deletion' }]),
     ],
     'actions-secrets': { total_count: 0 },
     'dependabot-secrets': { total_count: 0 },
@@ -270,34 +270,12 @@ function drift(mutate: (r: Record<string, any>) => void): string[] {
 
 const byName = (r: Record<string, any>, name: string): Json => (r.rulesets as Json[]).find((x) => x.name === name) as Json;
 
-test('SC-U2-3 b the clean fixture is clean, and the fifteen files are the ones the read job writes', () => {
+test('SC-U2-3 b the clean fixture is clean, and the sixteen files are the ones the read job writes', () => {
   assert.deepEqual(drift(() => {}), []);
-  assert.deepEqual([...FILES].sort(), ['actions-permissions', 'actions-secrets', 'branch-policies', 'dependabot-secrets', 'environment-secrets', 'environment-variables', 'environments', 'fork-pr-approval', 'private-vulnerability-reporting', 'releases', 'repository', 'rulesets', 'selected-actions', 'vulnerability-alerts', 'workflow-permissions']);
+  assert.deepEqual([...FILES].sort(), ['actions-permissions', 'actions-secrets', 'branch-policies', 'dependabot-secrets', 'environment-secrets', 'environment-variables', 'environments', 'fork-pr-approval', 'merge-options', 'private-vulnerability-reporting', 'releases', 'repository', 'rulesets', 'selected-actions', 'vulnerability-alerts', 'workflow-permissions']);
 });
 
-test('SC-U2-3 b the app bypass entry must match on actor type, id and mode, and be the only entry', () => {
-  const at = 'rulesets: rulesets.main-checks.bypass_actors';
-  for (const [name, entry] of [
-    ['actor type Team', { ...APP, actor_type: 'Team' }],
-    ['actor type OrganizationAdmin', { ...APP, actor_type: 'OrganizationAdmin' }],
-    ['actor id as a string', { ...APP, actor_id: '5512599' }],
-    ['actor id off by one', { ...APP, actor_id: 5512598 }],
-    ['mode exempt', { ...APP, bypass_mode: 'exempt' }],
-    ['mode pull_request', { ...APP, bypass_mode: 'pull_request' }],
-    ['mode missing', { actor_id: APP.actor_id, actor_type: APP.actor_type }],
-  ] as const) {
-    assert.ok(drift((r) => (byName(r, 'main-checks').bypass_actors = [entry])).includes(at), name);
-    assert.ok(drift((r) => (byName(r, 'tags-create').bypass_actors = [entry])).includes('rulesets: rulesets.tags-create.bypass_actors'), `tags-create ${name}`);
-  }
-  assert.ok(drift((r) => (byName(r, 'main-checks').bypass_actors = [])).includes(at), 'empty');
-  assert.ok(drift((r) => (byName(r, 'main-checks').bypass_actors = [{ ...APP }, { ...APP }])).includes(at), 'twice');
-  assert.ok(drift((r) => delete byName(r, 'main-checks').bypass_actors).includes(at), 'absent');
-  assert.ok(drift((r) => (byName(r, 'main-checks').bypass_actors = null)).includes(at), 'null');
-  for (const name of ['main-history', 'tags-locked']) {
-    assert.ok(drift((r) => delete byName(r, name).bypass_actors).includes(`rulesets: rulesets.${name}.bypass_actors`), `${name} absent`);
-    assert.ok(drift((r) => (byName(r, name).bypass_actors = [{ ...APP }])).includes(`rulesets: rulesets.${name}.bypass_actors`), `${name} with the app`);
-    assert.ok(drift((r) => (byName(r, name).bypass_actors = [{ actor_id: 1, actor_type: 'RepositoryRole', bypass_mode: 'always' }])).includes(`rulesets: rulesets.${name}.bypass_actors`), `${name} with a role`);
-  }
+test('SC-U2-3 b a ruleset of the other target is a finding by name', () => {
   for (const name of ['main-history', 'main-checks', 'tags-create', 'tags-locked']) {
     const other = byName(clean(), name).target === 'tag' ? 'branch' : 'tag';
     assert.ok(drift((r) => (byName(r, name).target = other)).includes(`rulesets: rulesets.${name}.target`), `${name} target`);
@@ -305,10 +283,10 @@ test('SC-U2-3 b the app bypass entry must match on actor type, id and mode, and 
 });
 
 test('SC-U2-3 b a ruleset name that appears twice, or not at all, is a finding by name', () => {
-  assert.ok(drift((r) => r.rulesets.push(ruleset('main-history', 'branch', '~DEFAULT_BRANCH', [], []))).includes('rulesets: rulesets.main-history'));
+  assert.ok(drift((r) => r.rulesets.push(ruleset('main-history', 'branch', '~DEFAULT_BRANCH', []))).includes('rulesets: rulesets.main-history'));
   assert.ok(drift((r) => (byName(r, 'main-checks').name = 'main-checks-2')).includes('rulesets: rulesets.main-checks'));
   assert.ok(drift((r) => (r.rulesets = {})).includes('rulesets: rulesets'));
-  assert.ok(drift((r) => r.rulesets.push(ruleset('extra', 'branch', '~ALL', [], []))).includes('rulesets: rulesets.count'));
+  assert.ok(drift((r) => r.rulesets.push(ruleset('extra', 'branch', '~ALL', []))).includes('rulesets: rulesets.count'));
   assert.ok(drift((r) => (r.rulesets = [])).includes('rulesets: rulesets.main-history'));
 });
 
@@ -386,11 +364,15 @@ test('SC-U2-46 c patterns, counts and flags are compared strictly', () => {
   assert.ok(drift((r) => (r['environment-variables'].total_count = 1)).includes('settings: environment-variables.total_count'));
   assert.ok(drift((r) => (r['private-vulnerability-reporting'].enabled = false)).includes('settings: private-vulnerability-reporting.enabled'));
   assert.ok(drift((r) => (r.repository.visibility = 'private')).includes('settings: repository.visibility'));
-  for (const key of ['allow_merge_commit', 'allow_rebase_merge', 'has_wiki', 'has_projects']) {
+  for (const key of ['has_wiki', 'has_projects']) {
     assert.ok(drift((r) => (r.repository[key] = true)).includes(`settings: repository.${key}`), key);
   }
-  for (const key of ['allow_squash_merge', 'delete_branch_on_merge', 'has_issues']) {
-    assert.ok(drift((r) => (r.repository[key] = false)).includes(`settings: repository.${key}`), key);
+  assert.ok(drift((r) => (r.repository.has_issues = false)).includes('settings: repository.has_issues'));
+  for (const key of ['allow_merge_commit', 'allow_rebase_merge', 'allow_auto_merge']) {
+    assert.ok(drift((r) => (r['merge-options'][key] = true)).includes(`settings: merge-options.${key}`), key);
+  }
+  for (const key of ['allow_squash_merge', 'delete_branch_on_merge']) {
+    assert.ok(drift((r) => (r['merge-options'][key] = false)).includes(`settings: merge-options.${key}`), key);
   }
   assert.ok(drift((r) => (r.repository.security_and_analysis.secret_scanning.status = 'disabled')).includes('settings: repository.security_and_analysis.secret_scanning.status'));
   assert.ok(drift((r) => delete r.repository.security_and_analysis).includes('settings: repository.security_and_analysis.secret_scanning.status'));

@@ -31,6 +31,7 @@ jobs:
       environments: ${{ steps.read.outputs.environments }}
       branch-policies: ${{ steps.read.outputs.branch-policies }}
       releases: ${{ steps.read.outputs.releases }}
+      merge-options: ${{ steps.merge-options.outputs.merge-options }}
     steps:
       - id: token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -92,6 +93,23 @@ jobs:
           with_job environments "$repo/environments"
           with_job branch-policies "$repo/environments/ircx-bot/deployment-branch-policies"
           with_job releases "$repo/releases"
+      - id: merge-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: Iv23liAz4GUkls9I3nc2
+          private-key: ${{ secrets.IRCX_BOT_PRIVATE_KEY }}
+          owner: ircx-io
+          repositories: ircx-docs
+          permission-contents: write
+      - id: merge-options
+        env:
+          GH_TOKEN: ${{ steps.merge-token.outputs.token }}
+        run: |
+          set -uo pipefail
+          if ! value="$(gh api repos/ircx-io/ircx-docs | jq -c '{allow_squash_merge, allow_merge_commit, allow_rebase_merge, allow_auto_merge, delete_branch_on_merge}')"; then
+            value=""
+          fi
+          printf 'merge-options=%s\n' "$value" >> "$GITHUB_OUTPUT"
 
   compare:
     needs: read
@@ -126,6 +144,7 @@ jobs:
           ENVIRONMENTS: ${{ needs.read.outputs.environments }}
           BRANCH_POLICIES: ${{ needs.read.outputs.branch-policies }}
           RELEASES: ${{ needs.read.outputs.releases }}
+          MERGE_OPTIONS: ${{ needs.read.outputs.merge-options }}
         run: |
           set -euo pipefail
           dir="$RUNNER_TEMP/settings"
@@ -145,6 +164,7 @@ jobs:
           printf '%s' "$ENVIRONMENTS" > "$dir/environments.json"
           printf '%s' "$BRANCH_POLICIES" > "$dir/branch-policies.json"
           printf '%s' "$RELEASES" > "$dir/releases.json"
+          printf '%s' "$MERGE_OPTIONS" > "$dir/merge-options.json"
       - id: compare
         run: |
           set -o pipefail

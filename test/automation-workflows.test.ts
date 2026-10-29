@@ -176,8 +176,8 @@ test('SC-U2-46 a the triggers, the permissions of each job, and a mint that asks
 });
 
 test('SC-U2-46 b the read job declares one output per settings file, and the compare job reads each from needs.read', () => {
-  const declared = [...(jobOf(SC, 'read').split('    outputs:\n')[1]?.split('    steps:')[0] ?? '').matchAll(/^ {6}([a-z-]+): \$\{\{ steps\.read\.outputs\.([a-z-]+) \}\}$/gm)];
-  assert.ok(declared.every((m) => m[1] === m[2]));
+  const declared = [...(jobOf(SC, 'read').split('    outputs:\n')[1]?.split('    steps:')[0] ?? '').matchAll(/^ {6}([a-z-]+): \$\{\{ steps\.([a-z-]+)\.outputs\.([a-z-]+) \}\}$/gm)];
+  assert.ok(declared.every((m) => m[1] === m[3] && m[2] === (m[1] === 'merge-options' ? 'merge-options' : 'read')));
   assert.deepEqual(declared.map((m) => m[1]).sort(), [...FILES].sort());
   const used = [...jobOf(SC, 'compare').matchAll(/needs\.read\.outputs\.([a-z-]+) \}\}/g)].map((m) => m[1]);
   assert.deepEqual([...used].sort(), [...FILES].sort());

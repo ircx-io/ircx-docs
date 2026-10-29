@@ -9,27 +9,26 @@ import { ROOT } from './helpers.ts';
 
 type Json = Record<string, unknown>;
 
-const APP = { actor_id: 5512599, actor_type: 'Integration', bypass_mode: 'always' };
-
-function ruleset(name: string, target: string, include: string, rules: Json[], bypass: Json[]): Json {
-  return { id: 1, name, target, enforcement: 'active', conditions: { ref_name: { include: [include], exclude: [] } }, rules, bypass_actors: bypass };
+/** A ruleset as the read token gets it: GitHub leaves out `bypass_actors` for a token that cannot write the ruleset. */
+function ruleset(name: string, target: string, include: string, rules: Json[]): Json {
+  return { id: 1, name, target, enforcement: 'active', conditions: { ref_name: { include: [include], exclude: [] } }, rules };
 }
 
-/** The responses the repository gives when every setting is as it was set up. */
+/**
+ * The responses the App's tokens get when every setting is as it was set up:
+ * `repository` from the read token, without the merge fields, and
+ * `merge-options` as the read job projects them from the Contents-write read.
+ */
 function expected(): Record<string, unknown> {
   return {
     repository: {
-      allow_squash_merge: true,
-      allow_merge_commit: false,
-      allow_rebase_merge: false,
-      allow_auto_merge: false,
-      delete_branch_on_merge: true,
       has_wiki: false,
       has_projects: false,
       has_issues: true,
       visibility: 'public',
       security_and_analysis: { secret_scanning: { status: 'enabled' }, secret_scanning_push_protection: { status: 'enabled' } },
     },
+    'merge-options': { allow_squash_merge: true, allow_merge_commit: false, allow_rebase_merge: false, allow_auto_merge: false, delete_branch_on_merge: true },
     'actions-permissions': { enabled: true, allowed_actions: 'selected', sha_pinning_required: true },
     'selected-actions': { github_owned_allowed: false, verified_allowed: false, patterns_allowed: ['actions/checkout@*', 'actions/create-github-app-token@*', 'actions/setup-node@*'] },
     'workflow-permissions': { default_workflow_permissions: 'read', can_approve_pull_request_reviews: false },
@@ -37,10 +36,10 @@ function expected(): Record<string, unknown> {
     'vulnerability-alerts': { enabled: true },
     'private-vulnerability-reporting': { enabled: true },
     rulesets: [
-      ruleset('main-history', 'branch', '~DEFAULT_BRANCH', [{ type: 'deletion' }, { type: 'non_fast_forward' }], []),
-      ruleset('main-checks', 'branch', '~DEFAULT_BRANCH', [{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'docs' }] } }], [{ ...APP }]),
-      ruleset('tags-create', 'tag', '~ALL', [{ type: 'creation' }], [{ ...APP }]),
-      ruleset('tags-locked', 'tag', '~ALL', [{ type: 'update' }, { type: 'deletion' }], []),
+      ruleset('main-history', 'branch', '~DEFAULT_BRANCH', [{ type: 'deletion' }, { type: 'non_fast_forward' }]),
+      ruleset('main-checks', 'branch', '~DEFAULT_BRANCH', [{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: false, required_status_checks: [{ context: 'docs' }] } }]),
+      ruleset('tags-create', 'tag', '~ALL', [{ type: 'creation' }]),
+      ruleset('tags-locked', 'tag', '~ALL', [{ type: 'update' }, { type: 'deletion' }]),
     ],
     'actions-secrets': { total_count: 0, secrets: [] },
     'dependabot-secrets': { total_count: 0, secrets: [] },
@@ -58,6 +57,24 @@ function findings(mutate: (r: Record<string, any>) => void = () => {}): string[]
   return compareSettings(r).map((f) => `${f.rule}: ${f.path}`);
 }
 
+test('SC-U2-46 c bypass_actors on a ruleset and merge fields on repository are not read', () => {
+  const bypass = [{ actor_id: 1, actor_type: 'User', bypass_mode: 'always' }];
+  assert.deepEqual(
+    findings((r) => {
+      for (const ruleset of r.rulesets) {
+        ruleset.bypass_actors = bypass;
+      }
+    }),
+    [],
+  );
+  assert.deepEqual(
+    findings((r) => {
+      Object.assign(r.repository, { allow_squash_merge: false, allow_merge_commit: true, allow_rebase_merge: true, allow_auto_merge: true, delete_branch_on_merge: false });
+    }),
+    [],
+  );
+});
+
 test('SC-U2-46 the expected settings give no finding', () => {
   assert.deepEqual(findings(), []);
   assert.deepEqual(Object.keys(expected()).sort(), [...FILES].sort());
@@ -69,24 +86,19 @@ test('SC-U2-46 c one finding per checked field', () => {
     ['main-history target', (r) => (rs(r, 'main-history').target = 'tag'), 'rulesets: rulesets.main-history.target'],
     ['main-history include', (r) => (rs(r, 'main-history').conditions.ref_name.include = ['~ALL']), 'rulesets: rulesets.main-history.conditions'],
     ['main-history rules', (r) => (rs(r, 'main-history').rules = [{ type: 'deletion' }]), 'rulesets: rulesets.main-history.rules'],
-    ['main-history bypass', (r) => (rs(r, 'main-history').bypass_actors = [{ ...APP }]), 'rulesets: rulesets.main-history.bypass_actors'],
     ['main-checks target', (r) => (rs(r, 'main-checks').target = 'tag'), 'rulesets: rulesets.main-checks.target'],
     ['main-checks include', (r) => (rs(r, 'main-checks').conditions.ref_name.include = ['refs/heads/x']), 'rulesets: rulesets.main-checks.conditions'],
     ['main-checks rules', (r) => (rs(r, 'main-checks').rules[0].parameters.required_status_checks = [{ context: 'other' }]), 'rulesets: rulesets.main-checks.rules.required_status_checks'],
     ['main-checks strict', (r) => (rs(r, 'main-checks').rules[0].parameters.strict_required_status_checks_policy = true), 'rulesets: rulesets.main-checks.rules.required_status_checks'],
-    ['main-checks bypass', (r) => rs(r, 'main-checks').bypass_actors.push({ actor_id: 5, actor_type: 'RepositoryRole', bypass_mode: 'always' }), 'rulesets: rulesets.main-checks.bypass_actors'],
-    ['main-checks bypass mode', (r) => (rs(r, 'main-checks').bypass_actors[0].bypass_mode = 'pull_request'), 'rulesets: rulesets.main-checks.bypass_actors'],
     ['tags-create target', (r) => (rs(r, 'tags-create').target = 'branch'), 'rulesets: rulesets.tags-create.target'],
     ['tags-create include', (r) => (rs(r, 'tags-create').conditions.ref_name.include = ['v*']), 'rulesets: rulesets.tags-create.conditions'],
     ['tags-create rules', (r) => rs(r, 'tags-create').rules.push({ type: 'update' }), 'rulesets: rulesets.tags-create.rules'],
-    ['tags-create bypass', (r) => (rs(r, 'tags-create').bypass_actors[0].actor_id = 1), 'rulesets: rulesets.tags-create.bypass_actors'],
     ['tags-locked target', (r) => (rs(r, 'tags-locked').target = 'branch'), 'rulesets: rulesets.tags-locked.target'],
     ['tags-locked include', (r) => (rs(r, 'tags-locked').conditions.ref_name.exclude = ['v1']), 'rulesets: rulesets.tags-locked.conditions'],
     ['tags-locked rules', (r) => (rs(r, 'tags-locked').rules = [{ type: 'update' }]), 'rulesets: rulesets.tags-locked.rules'],
-    ['tags-locked bypass', (r) => (rs(r, 'tags-locked').bypass_actors = [{ ...APP }]), 'rulesets: rulesets.tags-locked.bypass_actors'],
     ['a ruleset disabled', (r) => (rs(r, 'main-history').enforcement = 'evaluate'), 'rulesets: rulesets.main-history.enforcement'],
     ['a ruleset missing', (r) => (r.rulesets = r.rulesets.slice(1)), 'rulesets: rulesets.main-history'],
-    ['a fifth ruleset', (r) => r.rulesets.push(ruleset('extra', 'branch', '~ALL', [], [])), 'rulesets: rulesets.count'],
+    ['a fifth ruleset', (r) => r.rulesets.push(ruleset('extra', 'branch', '~ALL', [])), 'rulesets: rulesets.count'],
     ['patterns_allowed with a fourth entry', (r) => r['selected-actions'].patterns_allowed.push('evil/x@*'), 'settings: selected-actions.patterns_allowed'],
     ['patterns_allowed with two', (r) => r['selected-actions'].patterns_allowed.pop(), 'settings: selected-actions.patterns_allowed'],
     ['sha_pinning_required: false', (r) => (r['actions-permissions'].sha_pinning_required = false), 'settings: actions-permissions.sha_pinning_required'],
@@ -94,7 +106,13 @@ test('SC-U2-46 c one finding per checked field', () => {
     ['can_approve_pull_request_reviews: true', (r) => (r['workflow-permissions'].can_approve_pull_request_reviews = true), 'settings: workflow-permissions.can_approve_pull_request_reviews'],
     ['approval_policy changed', (r) => (r['fork-pr-approval'].approval_policy = 'first_time_contributors'), 'settings: fork-pr-approval.approval_policy'],
     ['has_issues: false', (r) => (r.repository.has_issues = false), 'settings: repository.has_issues'],
-    ['allow_auto_merge: true', (r) => (r.repository.allow_auto_merge = true), 'settings: repository.allow_auto_merge'],
+    ['allow_squash_merge: false', (r) => (r['merge-options'].allow_squash_merge = false), 'settings: merge-options.allow_squash_merge'],
+    ['allow_merge_commit: true', (r) => (r['merge-options'].allow_merge_commit = true), 'settings: merge-options.allow_merge_commit'],
+    ['allow_rebase_merge: true', (r) => (r['merge-options'].allow_rebase_merge = true), 'settings: merge-options.allow_rebase_merge'],
+    ['allow_auto_merge: true', (r) => (r['merge-options'].allow_auto_merge = true), 'settings: merge-options.allow_auto_merge'],
+    ['delete_branch_on_merge: false', (r) => (r['merge-options'].delete_branch_on_merge = false), 'settings: merge-options.delete_branch_on_merge'],
+    ['a merge field read as null', (r) => (r['merge-options'].allow_squash_merge = null), 'settings: merge-options.allow_squash_merge'],
+    ['an empty merge-options file', (r) => (r['merge-options'] = undefined), 'read: merge-options'],
     ['push protection off', (r) => (r.repository.security_and_analysis.secret_scanning_push_protection.status = 'disabled'), 'settings: repository.security_and_analysis.secret_scanning_push_protection.status'],
     ['vulnerability alerts off', (r) => (r['vulnerability-alerts'].enabled = false), 'settings: vulnerability-alerts.enabled'],
     ['a repository Actions secret', (r) => (r['actions-secrets'] = { total_count: 1, secrets: [{ name: 'X' }] }), 'settings: actions-secrets.total_count'],
@@ -145,6 +163,9 @@ test('SC-U2-46 b the entry point passes clean responses and fails on an empty or
   const broken = cli(expected(), { releases: '[{' });
   assert.equal(broken.status, 1);
   assert.equal(broken.stdout, 'read: releases\n');
+  const noMerge = cli(expected(), { 'merge-options': '' });
+  assert.equal(noMerge.status, 1);
+  assert.equal(noMerge.stdout, 'read: merge-options\n');
 });
 
 test('SC-U2-46 c no response key or value reaches the output', () => {
@@ -152,7 +173,7 @@ test('SC-U2-46 c no response key or value reaches the output', () => {
   const r = expected() as Record<string, any>;
   r['actions-secrets'] = { total_count: 1, secrets: [{ name: plant }] };
   r['environment-variables'] = { total_count: 1, variables: [{ name: 'X', value: plant }] };
-  r.rulesets.push(ruleset(plant, 'branch', plant, [{ type: plant }], [{ actor_id: plant }]));
+  r.rulesets.push({ ...ruleset(plant, 'branch', plant, [{ type: plant }]), bypass_actors: [{ actor_id: plant }] });
   r.repository[plant] = plant;
   r.repository.visibility = plant;
   const run = cli(r);

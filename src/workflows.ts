@@ -2,7 +2,7 @@
 // `uses:` line names an approved action at a full commit SHA with a version
 // comment, one action carries one SHA across all files, and after the SHA and
 // version are replaced by placeholders each file equals its canonical text
-// below. Structural rules W5 to W13 run beside the compare, so a change that
+// below. Structural rules W5 to W14 run beside the compare, so a change that
 // breaks one of them names the rule. No SHA or version is held here, so a
 // Dependabot bump keeps passing.
 
@@ -311,6 +311,7 @@ jobs:
       environments: \${{ steps.read.outputs.environments }}
       branch-policies: \${{ steps.read.outputs.branch-policies }}
       releases: \${{ steps.read.outputs.releases }}
+      merge-options: \${{ steps.merge-options.outputs.merge-options }}
     steps:
       - id: token
         uses: actions/create-github-app-token@<sha> # <version>
@@ -372,6 +373,23 @@ jobs:
           with_job environments "$repo/environments"
           with_job branch-policies "$repo/environments/ircx-bot/deployment-branch-policies"
           with_job releases "$repo/releases"
+      - id: merge-token
+        uses: actions/create-github-app-token@<sha> # <version>
+        with:
+          client-id: Iv23liAz4GUkls9I3nc2
+          private-key: \${{ secrets.IRCX_BOT_PRIVATE_KEY }}
+          owner: ircx-io
+          repositories: ircx-docs
+          permission-contents: write
+      - id: merge-options
+        env:
+          GH_TOKEN: \${{ steps.merge-token.outputs.token }}
+        run: |
+          set -uo pipefail
+          if ! value="$(gh api repos/ircx-io/ircx-docs | jq -c '{allow_squash_merge, allow_merge_commit, allow_rebase_merge, allow_auto_merge, delete_branch_on_merge}')"; then
+            value=""
+          fi
+          printf 'merge-options=%s\\n' "$value" >> "$GITHUB_OUTPUT"
 
   compare:
     needs: read
@@ -406,6 +424,7 @@ jobs:
           ENVIRONMENTS: \${{ needs.read.outputs.environments }}
           BRANCH_POLICIES: \${{ needs.read.outputs.branch-policies }}
           RELEASES: \${{ needs.read.outputs.releases }}
+          MERGE_OPTIONS: \${{ needs.read.outputs.merge-options }}
         run: |
           set -euo pipefail
           dir="$RUNNER_TEMP/settings"
@@ -425,6 +444,7 @@ jobs:
           printf '%s' "$ENVIRONMENTS" > "$dir/environments.json"
           printf '%s' "$BRANCH_POLICIES" > "$dir/branch-policies.json"
           printf '%s' "$RELEASES" > "$dir/releases.json"
+          printf '%s' "$MERGE_OPTIONS" > "$dir/merge-options.json"
       - id: compare
         run: |
           set -o pipefail
@@ -558,18 +578,33 @@ function runLines(lines: readonly string[]): Set<number> {
   return out;
 }
 
+/**
+ * What can stand right before a command word in the shell: whitespace (a shell
+ * line keeps its YAML indentation, so this covers the start of a line), a
+ * separator or an opening `(` or `{` (which covers `$(`), a backtick, a quote, a
+ * backslash, or the `/` of a path such as `/usr/bin/env`.
+ */
+const WORD_BEFORE = '[\\s;&|({`\'"\\\\/]';
+/** What can end a command word: the end of the line, whitespace, a separator, a closing `)` or `}`, a backtick, a quote or a redirection. */
+const WORD_AFTER = '(?=$|[\\s;&|)}`\'"<>])';
+
+/** A command word matching `name` (a regex alternative), at any shell boundary. */
+function commandWord(name: string, flags = ''): RegExp {
+  return new RegExp(`${WORD_BEFORE}(?:${name})${WORD_AFTER}`, flags);
+}
+
 /** Text in a key job's shell that runs repository code or a script (rule W10). */
 const KEY_JOB_FORBIDDEN: readonly RegExp[] = [
-  /(?:^|[\s;&|(])(?:node|npm|npx|source)(?:\s|$)/,
-  /(?:^|[\s;&|(])(?:bash|sh)\s+[^-\s]/,
-  /(?:^|[;&|(]\s*)\.\s+\S/,
+  commandWord('node|npm|npx|source'),
+  new RegExp(`${WORD_BEFORE}(?:bash|sh)\\s+[^-\\s]`),
+  /(?:^\s*|[;&|({`]\s*)\.\s+\S/,
   /(?:^|[\s"'=(])(?:\.\/|src\/|test\/|content\/|\.github\/)/,
 ];
 
 /** The `secrets` context inside an expression; a name such as `outputs.actions-secrets` is not it. */
 const SECRETS_CONTEXT = /\$\{\{.*(?<![\w.-])secrets(?![\w-])/;
 
-/** Applies the structural rules W5 to W13 to one workflow file. */
+/** Applies the structural rules W5 to W14 to one workflow file. */
 export function structuralFindings(name: string, text: string): Finding[] {
   const file = `.github/workflows/${name}`;
   const findings: Finding[] = [];
@@ -669,6 +704,7 @@ export function structuralFindings(name: string, text: string): Finding[] {
   }
 
   // W11: every App token step names this App, this owner and this repository, and asks for something.
+  // In settings-check.yml every permission is read, except on the merge-token step, which W14 governs.
   for (const job of jobs) {
     for (const step of job.steps) {
       if (step.uses !== APP_TOKEN_ACTION) {
@@ -692,7 +728,7 @@ export function structuralFindings(name: string, text: string): Finding[] {
       if (inputs.some((l) => l.startsWith('skip-token-revoke'))) {
         problems.push('no skip-token-revoke');
       }
-      if (name === 'settings-check.yml' && permissions.some((l) => !/^permission-[a-z-]+: read$/.test(l))) {
+      if (name === 'settings-check.yml' && stepId(step) !== MERGE_TOKEN && permissions.some((l) => !/^permission-[a-z-]+: read$/.test(l))) {
         problems.push('read permissions only');
       }
       if (problems.length > 0) {
@@ -705,7 +741,300 @@ export function structuralFindings(name: string, text: string): Finding[] {
   if (name !== 'ci.yml' && lines.includes('name: CI')) {
     push(undefined, 'W13', 'only ci.yml is named CI');
   }
+
+  if (name === 'settings-check.yml') {
+    mergeTokenFindings(lines, jobs, shell, push);
+  }
   return findings;
+}
+
+const MERGE_TOKEN = 'merge-token';
+const MERGE_OPTIONS = 'merge-options';
+const MERGE_TOKEN_ENV = 'GH_TOKEN: ${{ steps.merge-token.outputs.token }}';
+/** The one line of the merge-options shell that writes `GITHUB_OUTPUT`. */
+const MERGE_OPTIONS_OUTPUT = `printf 'merge-options=%s\\n' "$value" >> "$GITHUB_OUTPUT"`;
+
+/** The step's id, from a `- id:` first line or an `id:` key at step level. */
+function stepId(step: Step): string | undefined {
+  for (const line of step.lines) {
+    const m = /^ {6}- id: (\S+)$|^ {8}id: (\S+)$/.exec(line);
+    if (m !== null) {
+      return m[1] ?? m[2];
+    }
+  }
+  return undefined;
+}
+
+/** A `gh` command word; the match ends with the word. */
+const GH_WORD = commandWord('gh', 'g');
+/** An `env` command word, a path ending `/env` included. */
+const ENV_WORD = commandWord('env');
+/** A `set` command word not followed by an option. Bare `set` lists every variable. */
+const BARE_SET = new RegExp(`${WORD_BEFORE}set${WORD_AFTER}(?!\\s+[-+])`);
+/** The merge-options line that reads the repository's merge fields. */
+const MERGE_OPTIONS_READ = `if ! value="$(gh api repos/ircx-io/ircx-docs | jq -c '{allow_squash_merge, allow_merge_commit, allow_rebase_merge, allow_auto_merge, delete_branch_on_merge}')"; then`;
+/** The merge-options `run:` text from its `|` on, trimmed and without blank lines: the one form W14 accepts. */
+const MERGE_OPTIONS_RUN: readonly string[] = ['|', 'set -uo pipefail', MERGE_OPTIONS_READ, 'value=""', 'fi', MERGE_OPTIONS_OUTPUT];
+/** The merge-token step, line for line, with its `uses:` pin normalised as W4 normalises it. */
+const MERGE_TOKEN_STEP: readonly string[] = [
+  `      - id: ${MERGE_TOKEN}`,
+  `        uses: ${APP_TOKEN_ACTION}@<sha> # <version>`,
+  '        with:',
+  '          client-id: Iv23liAz4GUkls9I3nc2',
+  `          ${PRIVATE_KEY_LINE}`,
+  '          owner: ircx-io',
+  '          repositories: ircx-docs',
+  '          permission-contents: write',
+];
+/** The merge-options step, line for line. */
+const MERGE_OPTIONS_STEP: readonly string[] = [
+  `      - id: ${MERGE_OPTIONS}`,
+  '        env:',
+  `          ${MERGE_TOKEN_ENV}`,
+  '        run: |',
+  '          set -uo pipefail',
+  `          ${MERGE_OPTIONS_READ}`,
+  '            value=""',
+  '          fi',
+  `          ${MERGE_OPTIONS_OUTPUT}`,
+];
+/**
+ * Job read, line for line, with both `uses:` pins normalised as W4 normalises them.
+ * It is written out rather than read from `CANONICAL`, so W14 does not depend on W4's canonical text.
+ */
+const READ_JOB: readonly string[] = [
+  ...`  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ircx-bot
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      repository: \${{ steps.read.outputs.repository }}
+      actions-permissions: \${{ steps.read.outputs.actions-permissions }}
+      selected-actions: \${{ steps.read.outputs.selected-actions }}
+      workflow-permissions: \${{ steps.read.outputs.workflow-permissions }}
+      fork-pr-approval: \${{ steps.read.outputs.fork-pr-approval }}
+      vulnerability-alerts: \${{ steps.read.outputs.vulnerability-alerts }}
+      private-vulnerability-reporting: \${{ steps.read.outputs.private-vulnerability-reporting }}
+      rulesets: \${{ steps.read.outputs.rulesets }}
+      actions-secrets: \${{ steps.read.outputs.actions-secrets }}
+      dependabot-secrets: \${{ steps.read.outputs.dependabot-secrets }}
+      environment-secrets: \${{ steps.read.outputs.environment-secrets }}
+      environment-variables: \${{ steps.read.outputs.environment-variables }}
+      environments: \${{ steps.read.outputs.environments }}
+      branch-policies: \${{ steps.read.outputs.branch-policies }}
+      releases: \${{ steps.read.outputs.releases }}
+      merge-options: \${{ steps.merge-options.outputs.merge-options }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@<sha> # <version>
+        with:
+          client-id: Iv23liAz4GUkls9I3nc2
+          private-key: \${{ secrets.IRCX_BOT_PRIVATE_KEY }}
+          owner: ircx-io
+          repositories: ircx-docs
+          permission-administration: read
+          permission-secrets: read
+          permission-dependabot-secrets: read
+          permission-environments: read
+      - id: read
+        env:
+          APP_TOKEN: \${{ steps.token.outputs.token }}
+          JOB_TOKEN: \${{ github.token }}
+        run: |
+          set -uo pipefail
+          repo=repos/ircx-io/ircx-docs
+          record() {
+            printf '%s=%s\\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+          }
+          with_app() {
+            local value
+            if value="$(GH_TOKEN="$APP_TOKEN" gh api "$2" | jq -c .)"; then record "$1" "$value"; else record "$1" ""; fi
+          }
+          with_job() {
+            local value
+            if value="$(GH_TOKEN="$JOB_TOKEN" gh api --paginate "$2" | jq -c -s .)"; then record "$1" "$value"; else record "$1" ""; fi
+          }
+          with_app repository "$repo"
+          with_app actions-permissions "$repo/actions/permissions"
+          with_app selected-actions "$repo/actions/permissions/selected-actions"
+          with_app workflow-permissions "$repo/actions/permissions/workflow"
+          with_app fork-pr-approval "$repo/actions/permissions/fork-pr-contributor-approval"
+          with_app private-vulnerability-reporting "$repo/private-vulnerability-reporting"
+          with_app actions-secrets "$repo/actions/secrets"
+          with_app dependabot-secrets "$repo/dependabot/secrets"
+          with_app environment-secrets "$repo/environments/ircx-bot/secrets"
+          with_app environment-variables "$repo/environments/ircx-bot/variables"
+          if alerts="$(GH_TOKEN="$APP_TOKEN" gh api "$repo/vulnerability-alerts" 2>&1)"; then
+            record vulnerability-alerts '{"enabled":true}'
+          else
+            case "$alerts" in
+              *"(HTTP 404)"*) record vulnerability-alerts '{"enabled":false}' ;;
+              *) record vulnerability-alerts "" ;;
+            esac
+          fi
+          rulesets=""
+          if ids="$(GH_TOKEN="$APP_TOKEN" gh api "$repo/rulesets" --jq '.[].id')"; then
+            rulesets="[]"
+            for id in $ids; do
+              [[ "$id" =~ ^[0-9]{1,12}$ ]] || { rulesets=""; break; }
+              one="$(GH_TOKEN="$APP_TOKEN" gh api "$repo/rulesets/$id" | jq -c .)" || { rulesets=""; break; }
+              rulesets="$(jq -c --argjson one "$one" '. + [$one]' <<< "$rulesets")" || { rulesets=""; break; }
+            done
+          fi
+          record rulesets "$rulesets"
+          with_job environments "$repo/environments"
+          with_job branch-policies "$repo/environments/ircx-bot/deployment-branch-policies"
+          with_job releases "$repo/releases"`.split('\n'),
+  ...MERGE_TOKEN_STEP,
+  ...MERGE_OPTIONS_STEP,
+];
+/** The word `steps` in any case, outside a longer name. The caller strips a `steps:` key first. */
+const STEPS_WORD = /(?<![\w-])steps(?![\w-])/gi;
+/** The one shape a `steps` reference may take: one step's named output, or its outcome. */
+const STEPS_REFERENCE = /^steps\.[a-z][a-z0-9-]*\.(?:outputs\.[a-z][a-z0-9-]*|outcome)(?![\w.[])/;
+/** Text the merge-options shell never holds: a verb or field flag, another endpoint kind, the token's name, or an environment dump. */
+const MERGE_OPTIONS_FORBIDDEN: readonly string[] = ['-X', '--method', '-f ', '-F ', '--field', '--raw-field', '--input', '--paginate', 'graphql', 'GH_TOKEN', 'printenv', 'declare', 'export', '/proc/'];
+const FILE_COMMANDS: readonly string[] = ['GITHUB_ENV', 'GITHUB_PATH', 'GITHUB_STEP_SUMMARY', 'GITHUB_STATE'];
+
+/**
+ * W14 (settings-check.yml): the Contents-write token is minted only as the
+ * second-to-last step of the read job and reaches only the last step,
+ * `merge-options`, through one env key; that step makes one GET of the
+ * repository and writes only its own output. The pins cover the lines
+ * `parseJobs` sees and the `defaults:` and `env:` spellings clause 1 matches;
+ * a column-0 comment inside job read or a workflow-level complex key escapes
+ * them, and W4 alone catches those.
+ */
+function mergeTokenFindings(lines: readonly string[], jobs: readonly Job[], shell: ReadonlySet<number>, push: (line: number | undefined, rule: string, message: string) => void): void {
+  // No default shell or working directory, and no env that every step of a job inherits.
+  lines.forEach((line, i) => {
+    if (/^\s*(?:- )?["']?defaults["']?\s*:/.test(line)) {
+      push(i, 'W14', 'no defaults: key');
+    }
+    const env = /^(\s*)(- )?["']?env["']?\s*:/.exec(line);
+    if (env !== null && (env[1] ?? '').length + (env[2] ?? '').length < 8) {
+      push(i, 'W14', 'no env: key at workflow or job level');
+    }
+  });
+
+  // (a) Exactly two App token steps, both in read; merge-token asks for Contents write alone.
+  const mints = jobs.flatMap((job) => job.steps.filter((s) => s.uses === APP_TOKEN_ACTION).map((step) => ({ job: job.name, step })));
+  if (mints.length !== 2 || mints.some((m) => m.job !== 'read')) {
+    push(mints[0]?.step.start, 'W14', 'exactly two App token steps, both in job read');
+  }
+  const mint = mints.find((m) => m.job === 'read' && stepId(m.step) === MERGE_TOKEN)?.step;
+  const permissions = mint?.lines.map((l) => l.trim()).filter((l) => l.startsWith('permission-')) ?? [];
+  if (mint === undefined || permissions.length !== 1 || permissions[0] !== 'permission-contents: write') {
+    push(mint?.start, 'W14', 'the merge-token step asks for permission-contents: write alone');
+  }
+
+  // (b) In read, merge-token follows the step read, and merge-options follows merge-token as the last step.
+  const steps = jobs.find((j) => j.name === 'read')?.steps ?? [];
+  const ids = steps.map(stepId);
+  if (!ids.slice(0, -2).includes('read') || ids.slice(-2).join(' ') !== `${MERGE_TOKEN} ${MERGE_OPTIONS}`) {
+    push(steps[0]?.start, 'W14', 'job read ends with merge-token and then merge-options, after the step read');
+  }
+
+  // (c) The token is named once, as the only env key of merge-options.
+  const step = steps.find((s) => stepId(s) === MERGE_OPTIONS);
+  const uses = lines.filter((l) => l.includes('steps.merge-token.outputs')).length;
+  const envAt = step?.lines.findIndex((l) => l === '        env:') ?? -1;
+  const env: string[] = [];
+  if (step !== undefined && envAt >= 0) {
+    for (const line of step.lines.slice(envAt + 1)) {
+      if (line.trim() !== '' && indentOf(line) <= 8) {
+        break;
+      }
+      if (line.trim() !== '') {
+        env.push(line.trim());
+      }
+    }
+  }
+  if (uses !== 1 || env.length !== 1 || env[0] !== MERGE_TOKEN_ENV) {
+    push(step?.start, 'W14', `the merge-token output is read once, as the only env key of merge-options: ${MERGE_TOKEN_ENV}`);
+  }
+  // Every steps reference names one step's output or outcome, so no index, wildcard or whole-context form reaches the token.
+  lines.forEach((line, i) => {
+    const text = line.replace(/^\s*steps\s*:/, '');
+    for (const m of text.matchAll(STEPS_WORD)) {
+      if (!STEPS_REFERENCE.test(text.slice(m.index))) {
+        push(i, 'W14', 'every steps reference has the form steps.<id>.outputs.<name> or steps.<id>.outcome');
+      }
+    }
+  });
+  if (lines.filter((l) => /merge-token/i.test(l)).length !== 2) {
+    push(undefined, 'W14', `merge-token is named on exactly two lines: - id: ${MERGE_TOKEN} and ${MERGE_TOKEN_ENV}`);
+  }
+  // No line of job read outside merge-options names GITHUB_ENV or GITHUB_PATH. The job pin below holds the rest of the lines `parseJobs` sees; a column-0 comment ends that view, and W4 alone stands there.
+  const read = jobs.find((j) => j.name === 'read');
+  read?.lines.forEach((line, k) => {
+    const i = read.start + k;
+    const inOptions = step !== undefined && i >= step.start && i < step.start + step.lines.length;
+    if (!inOptions && /GITHUB_ENV|GITHUB_PATH/.test(line)) {
+      push(i, 'W14', 'no GITHUB_ENV or GITHUB_PATH in job read');
+    }
+  });
+  // The whole merge-token step is pinned, so no added input (github-api-url, enterprise) or step key changes the mint.
+  const mintStep = steps.find((s) => stepId(s) === MERGE_TOKEN);
+  const mintLines = mintStep === undefined ? [] : normalise('', mintStep.lines.join('\n'), new Map()).text.split('\n');
+  if (!sameLines(mintLines, MERGE_TOKEN_STEP)) {
+    push(mintStep?.start, 'W14', 'the merge-token step is exactly its canonical lines, its uses: pin aside');
+  }
+
+  // (d) The shell makes one GET of the repository and writes only its own output line.
+  // Each problem is its own finding, so one line that breaks two clauses names both.
+  const body = step === undefined ? [] : step.lines.filter((_, k) => shell.has(step.start + k)).map((l) => l.replace(/^\s*(- )?run:\s*/, ' '));
+  const words = body.flatMap((l) => [...l.matchAll(GH_WORD)].map((m) => l.slice((m.index ?? 0) + m[0].length - 2)));
+  const problems: string[] = [];
+  if (words.length !== 1 || !/^gh api repos\/ircx-io\/ircx-docs\s+\|/.test(words[0] ?? '')) {
+    problems.push('exactly one gh command, gh api repos/ircx-io/ircx-docs into a pipe');
+  }
+  const text = body.join('\n');
+  for (const word of MERGE_OPTIONS_FORBIDDEN) {
+    if (text.includes(word)) {
+      problems.push(`no ${word.trim()}`);
+    }
+  }
+  if (body.some((l) => ENV_WORD.test(l))) {
+    problems.push('no env command');
+  }
+  if (body.some((l) => BARE_SET.test(l))) {
+    problems.push('no set without an option');
+  }
+  for (const name of FILE_COMMANDS) {
+    if (text.includes(name)) {
+      problems.push(`no ${name}`);
+    }
+  }
+  if (body.some((l) => l.includes('GITHUB_OUTPUT') && l.trim() !== MERGE_OPTIONS_OUTPUT)) {
+    problems.push(`GITHUB_OUTPUT written only by ${MERGE_OPTIONS_OUTPUT}`);
+  }
+  const run = body.map((l) => l.trim()).filter((l) => l !== '');
+  if (run.length !== MERGE_OPTIONS_RUN.length || run.some((l, k) => l !== MERGE_OPTIONS_RUN[k])) {
+    problems.push('its run text to be exactly the lines of its canonical form');
+  }
+  for (const problem of problems) {
+    push(step?.start, 'W14', `the merge-options step needs ${problem}`);
+  }
+  // The whole merge-options step is pinned, so no shell:, working-directory: or other step key changes how its run text runs.
+  if (step === undefined || !sameLines(step.lines, MERGE_OPTIONS_STEP)) {
+    push(step?.start, 'W14', 'the merge-options step is exactly its canonical lines');
+  }
+  // Job read as `parseJobs` sees it is pinned, so a changed job key (container, runs-on) or added shell in the step read fails W14. `parseJobs` stops at a column-0 line, a comment included, so lines after one are not compared here.
+  const readLines = read === undefined ? [] : normalise('', read.lines.join('\n'), new Map()).text.split('\n');
+  while (readLines.length > 0 && (readLines.at(-1) ?? '').trim() === '') {
+    readLines.pop();
+  }
+  if (!sameLines(readLines, READ_JOB)) {
+    push(read?.start, 'W14', 'job read is exactly its canonical lines, its uses: pins aside');
+  }
+}
+
+function sameLines(got: readonly string[], want: readonly string[]): boolean {
+  return got.length === want.length && got.every((l, k) => l === want[k]);
 }
 
 function listFiles(dir: string, prefix: string): string[] {

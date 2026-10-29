@@ -9,9 +9,6 @@
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
-/** The GitHub App the two bypass lists name. */
-export const APP_ID = 5512599;
-
 /** The commit identity every release is authored by. */
 export const RELEASE_AUTHOR = 'ircx-io-bot[bot]';
 
@@ -23,17 +20,20 @@ type Expect = readonly [path: readonly string[], value: string | number | boolea
 /** The scalar settings, by response file (SC-U2-3 a and b). */
 export const SCALARS: Readonly<Record<string, readonly Expect[]>> = Object.freeze({
   repository: [
-    [['allow_squash_merge'], true],
-    [['allow_merge_commit'], false],
-    [['allow_rebase_merge'], false],
-    [['allow_auto_merge'], false],
-    [['delete_branch_on_merge'], true],
     [['has_wiki'], false],
     [['has_projects'], false],
     [['has_issues'], true],
     [['visibility'], 'public'],
     [['security_and_analysis', 'secret_scanning', 'status'], 'enabled'],
     [['security_and_analysis', 'secret_scanning_push_protection', 'status'], 'enabled'],
+  ],
+  // The read job reads these with a Contents-write token, because GitHub returns them only to one.
+  'merge-options': [
+    [['allow_squash_merge'], true],
+    [['allow_merge_commit'], false],
+    [['allow_rebase_merge'], false],
+    [['allow_auto_merge'], false],
+    [['delete_branch_on_merge'], true],
   ],
   'actions-permissions': [
     [['enabled'], true],
@@ -73,6 +73,7 @@ export const FILES: readonly string[] = Object.freeze([
   'environments',
   'branch-policies',
   'releases',
+  'merge-options',
 ]);
 
 interface RulesetShape {
@@ -80,15 +81,14 @@ interface RulesetShape {
   readonly target: string;
   readonly include: string;
   readonly rules: readonly string[];
-  readonly appBypass: boolean;
 }
 
-/** The four rulesets (SC-U2-3 b). */
+/** The four rulesets (SC-U2-3 b). Their bypass lists are not read here: GitHub returns them only to a token that can write the ruleset. */
 export const RULESETS: readonly RulesetShape[] = Object.freeze([
-  { name: 'main-history', target: 'branch', include: '~DEFAULT_BRANCH', rules: ['deletion', 'non_fast_forward'], appBypass: false },
-  { name: 'main-checks', target: 'branch', include: '~DEFAULT_BRANCH', rules: ['required_status_checks'], appBypass: true },
-  { name: 'tags-create', target: 'tag', include: '~ALL', rules: ['creation'], appBypass: true },
-  { name: 'tags-locked', target: 'tag', include: '~ALL', rules: ['deletion', 'update'], appBypass: false },
+  { name: 'main-history', target: 'branch', include: '~DEFAULT_BRANCH', rules: ['deletion', 'non_fast_forward'] },
+  { name: 'main-checks', target: 'branch', include: '~DEFAULT_BRANCH', rules: ['required_status_checks'] },
+  { name: 'tags-create', target: 'tag', include: '~ALL', rules: ['creation'] },
+  { name: 'tags-locked', target: 'tag', include: '~ALL', rules: ['deletion', 'update'] },
 ]);
 
 /** One difference: a rule id and a field path, both from this module's constants. */
@@ -151,17 +151,6 @@ function checkRuleset(found: Json, want: RulesetShape, out: SettingsFinding[]): 
     if (get(params, ['strict_required_status_checks_policy']) !== false || contexts === undefined || !sameStrings(contexts, ['docs'])) {
       out.push({ rule: 'rulesets', path: `${at}.rules.required_status_checks` });
     }
-  }
-  const bypass = get(found, ['bypass_actors']);
-  const appOnly =
-    Array.isArray(bypass) &&
-    bypass.length === 1 &&
-    get(bypass[0], ['actor_type']) === 'Integration' &&
-    get(bypass[0], ['actor_id']) === APP_ID &&
-    get(bypass[0], ['bypass_mode']) === 'always';
-  const ok = want.appBypass ? appOnly : Array.isArray(bypass) && bypass.length === 0;
-  if (!ok) {
-    out.push({ rule: 'rulesets', path: `${at}.bypass_actors` });
   }
 }
 

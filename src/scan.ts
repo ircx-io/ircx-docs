@@ -152,7 +152,8 @@ export function scanLine(line: string): string[] {
     }
   }
   for (const m of line.matchAll(GITHUB_REPO)) {
-    const path = `/${m[1] ?? ''}/${(m[2] ?? '').replace(/\.git$/, '')}`;
+    // One trailing full stop, as at the end of a sentence, is dropped first, then a `.git` suffix.
+    const path = `/${m[1] ?? ''}/${(m[2] ?? '').replace(/\.$/, '').replace(/\.git$/, '')}`;
     if (path.toLowerCase() !== GITHUB_REPO_PATH) {
       rules.add('S5');
     }

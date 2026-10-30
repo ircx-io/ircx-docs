@@ -370,6 +370,254 @@ test('SC-U2-47 W11 every App token step names this App, owner and repository, as
   assert.ok(!has('settings-check.yml', 'token', (s) => `${s}\n          permission-contents: read`), 'settings read');
 });
 
+// ---------------------------------------------------------------------------
+// SC-U2-54 (G-3): the with: block of an App token step sets only the inputs the App needs.
+
+const MINTS: readonly (readonly [file: string, id: string])[] = [
+  ['cut-release.yml', 'token'],
+  ['dependabot-merge.yml', 'contents-token'],
+  ['dependabot-merge.yml', 'workflows-token'],
+  ['settings-check.yml', 'token'],
+  ['settings-check.yml', 'merge-token'],
+];
+const G3_MESSAGE = 'the App token step needs only client-id, private-key, owner, repositories and permission- inputs';
+const WITH_PROBLEM = 'one with: key alone on its line';
+const WITH_MESSAGE = `the App token step needs ${WITH_PROBLEM}`;
+/** A host no real input names, built at run time so the publication scan has nothing to read. */
+const PLANTED_HOST = ['example', 'invalid'].join('.');
+const EXTRA_INPUT = `github-api-url: https://${PLANTED_HOST}`;
+
+/** Applies `change` to the App token step `id` of `file`, from its `- id:` line to the next step. */
+function inMint(id: string, change: (step: string) => string): Transform {
+  return (text) => {
+    const at = text.indexOf(`      - id: ${id}\n`);
+    assert.ok(at >= 0, id);
+    const end = text.indexOf('\n      - ', at + 10);
+    assert.ok(end > at, `${id} is not the last step`);
+    const step = text.slice(at, end);
+    const changed = change(step);
+    assert.notEqual(changed, step);
+    return text.slice(0, at) + changed + text.slice(end);
+  };
+}
+
+/** The W11 messages of `file` after `change`. */
+function w11(file: string, change: Transform): string[] {
+  return structuralFindings(file, change(base(file)))
+    .filter((f) => f.rule === 'W11')
+    .map((f) => f.message);
+}
+
+test('SC-U2-54 c an input outside the approved set in the with: block of each of the five App token steps is a W11 finding', () => {
+  for (const [file, id] of MINTS) {
+    assert.deepEqual(w11(file, (t) => t), [], `${file} ${id} as shipped`);
+    const found = w11(file, inMint(id, (s) => `${s}\n          ${EXTRA_INPUT}`));
+    assert.deepEqual(found, [G3_MESSAGE], `${file} ${id}`);
+  }
+});
+
+test('SC-U2-54 c each spelling of a line that is not an approved input is a W11 finding, and the message prints none of it', () => {
+  const refused = [
+    `"github-api-url": https://${PLANTED_HOST}`,
+    `'github-api-url': https://${PLANTED_HOST}`,
+    '? github-api-url',
+    `: https://${PLANTED_HOST}`,
+    'client-id-x: y',
+    'x-client-id: y',
+    'owner2: x',
+    'private-keys: x',
+    'repositoriesx: y',
+    'permission-Contents: read',
+    'permission-contents:write',
+    'permission-: read',
+    'permission-contents',
+  ];
+  for (const line of refused) {
+    const found = w11('cut-release.yml', inMint('token', (s) => `${s}\n          ${line}`));
+    assert.deepEqual(found, [G3_MESSAGE], line);
+  }
+  // A continuation line under an approved input is a line of the block that sets no approved input.
+  assert.deepEqual(w11('cut-release.yml', inMint('token', (s) => s.replace('repositories: ircx-docs', 'repositories: ircx-docs\n            more'))), [G3_MESSAGE], 'a continuation line');
+  assert.deepEqual(w11('cut-release.yml', inMint('token', (s) => s.replace('owner: ircx-io', 'owner: >-\n            ircx-io'))).length > 0, true, 'a folded owner');
+  for (const line of [...refused, EXTRA_INPUT]) {
+    const message = w11('cut-release.yml', inMint('token', (s) => `${s}\n          ${line}`)).join('\n');
+    assert.ok(!message.includes(PLANTED_HOST) && !message.includes('github-api-url') && !message.includes(line), `the message echoes ${line}`);
+  }
+});
+
+test('SC-U2-54 c a valid approved input line passes, and so does an input with a trailing comment', () => {
+  for (const line of ['permission-issues: read', 'permission-pull-requests: read # note', 'permission-contents: write']) {
+    assert.deepEqual(w11('cut-release.yml', inMint('token', (s) => `${s}\n          ${line}`)), [], line);
+  }
+});
+
+test('SC-U2-54 b blank and comment lines neither end the with: block nor count as inputs', () => {
+  const fillers = ['# c', '#c', '    # c', '          # c', '', '   ', '\t'];
+  for (const filler of fillers) {
+    // As the only addition, a filler line is not an input.
+    assert.deepEqual(w11('cut-release.yml', inMint('token', (s) => `${s}\n${filler}`)), [], `alone ${JSON.stringify(filler)}`);
+    // Before an extra input, it does not end the block, so the input is still seen.
+    for (const [file, id] of MINTS) {
+      const found = w11(file, inMint(id, (s) => `${s}\n${filler}\n          ${EXTRA_INPUT}`));
+      assert.deepEqual(found, [G3_MESSAGE], `${file} ${id} after ${JSON.stringify(filler)}`);
+    }
+  }
+  // In the middle of the block, ahead of the approved inputs that follow it.
+  assert.deepEqual(w11('cut-release.yml', inMint('token', (s) => s.replace('          owner: ircx-io\n', `# c\n\n          ${EXTRA_INPUT}\n          owner: ircx-io\n`))), [G3_MESSAGE], 'a comment and a blank line ahead of more inputs');
+});
+
+test('SC-U2-54 b the block ends at the first line indented no deeper than with:', () => {
+  // A step key at the indent of with: is not a line of the block, and neither is the next step.
+  assert.deepEqual(w11('cut-release.yml', inMint('token', (s) => `${s}\n        timeout-minutes: 5`)), [], 'a step key after the block');
+  assert.deepEqual(w11('cut-release.yml', inMint('token', (s) => `${s}\n        timeout-minutes: 5\n        ${EXTRA_INPUT}`)), [], 'a step key, then a line at the same indent');
+  assert.deepEqual(w11('cut-release.yml', inMint('token', (s) => `${s}\n        ${EXTRA_INPUT}`)), [], 'a line at the indent of with:');
+  // One column deeper than with: is in the block.
+  assert.deepEqual(w11('cut-release.yml', inMint('token', (s) => `${s}\n         ${EXTRA_INPUT}`)), [G3_MESSAGE], 'one column deeper');
+});
+
+test('SC-U2-54 a the with: line is exactly with: and the step has one', () => {
+  const withBlock = (s: string): string => s.slice(s.indexOf('        with:'));
+  for (const [file, id] of MINTS) {
+    // An inline flow mapping holds the inputs on the with: line.
+    const flow = w11(file, inMint(id, (s) => s.replace(withBlock(s), `        with: { client-id: ${KEY}, ${EXTRA_INPUT} }`)));
+    assert.ok(flow.some((m) => m.includes(WITH_PROBLEM)), `${file} ${id}: inline flow`);
+    // A comment after the colon, a quoted key, a second with: key and no with: key.
+    const others: readonly (readonly [string, (s: string) => string])[] = [
+      ['a trailing comment', (s) => s.replace('        with:\n', '        with: # c\n')],
+      ['a quoted key', (s) => s.replace('        with:\n', '        "with":\n')],
+      ['a second with: key', (s) => `${s}\n        with:\n          owner: ircx-io`],
+      ['no with: key', (s) => s.replace(withBlock(s), '')],
+    ];
+    for (const [name, change] of others) {
+      assert.ok(w11(file, inMint(id, change)).some((m) => m.includes(WITH_PROBLEM)), `${file} ${id}: ${name}`);
+    }
+  }
+  // With the comment after the colon the block lines are unchanged, so this is the only problem.
+  assert.deepEqual(w11('cut-release.yml', inMint('token', (s) => s.replace('        with:\n', '        with: # c\n'))), [WITH_MESSAGE]);
+});
+
+test('SC-U2-54 d INPUT_ in any case on any line of any of the five workflows is a W11 finding', () => {
+  const found = (file: string, text: string): string[] =>
+    structuralFindings(file, text)
+      .filter((f) => f.rule === 'W11')
+      .map((f) => f.message);
+  for (const file of NAMES) {
+    for (const word of ['INPUT_X', 'input_x', 'Input_X', 'iNpUt_x', 'user_input_x']) {
+      const messages = found(file, `${base(file).trimEnd()}\n# ${word}\n`);
+      assert.equal(messages.length, 1, `${file}: ${word}`);
+      assert.ok(messages[0]?.includes('INPUT_'), `${file}: ${word}`);
+      assert.ok(!messages[0]?.includes(word), `${file}: the message echoes ${word}`);
+    }
+    // The words input and inputs, as the dispatch inputs are spelled, are not the environment form.
+    assert.deepEqual(found(file, `${base(file).trimEnd()}\n# input inputs.tag input-x\n`), [], file);
+  }
+  // A step env on the cut-release mint, and a job env on merge in dependabot-merge.yml.
+  const stepEnv = found('cut-release.yml', inMint('token', (s) => s.replace('        with:\n', `        env:\n          INPUT_GITHUB-API-URL: https://${PLANTED_HOST}\n        with:\n`))(base('cut-release.yml')));
+  assert.equal(stepEnv.length, 1);
+  assert.ok(stepEnv[0]?.includes('INPUT_') && !stepEnv[0].includes(PLANTED_HOST));
+  const jobEnv = found('dependabot-merge.yml', sub('    environment: ircx-bot\n', '    environment: ircx-bot\n    env:\n      input_github-api-url: x\n')(base('dependabot-merge.yml')));
+  assert.equal(jobEnv.length, 1);
+  assert.ok(jobEnv[0]?.includes('INPUT_'));
+});
+
+test('SC-U2-54 d a YAML escape or a line-ending backslash on any line of any of the five workflows is a W11 finding', () => {
+  const ESCAPE = 'no YAML hex or unicode escape and no line ending in a backslash';
+  const found = (file: string, text: string): string[] =>
+    structuralFindings(file, text)
+      .filter((f) => f.rule === 'W11')
+      .map((f) => f.message);
+  // Each spelling decodes to an INPUT_ key, but no line holds the text INPUT_.
+  const spellings = [
+    '"\\x49NPUT_GITHUB-API-URL"',
+    '"\\x69nput_github-api-url"',
+    '"INPUT\\x5FGITHUB-API-URL"',
+    '"INPUT\\x5fGITHUB-API-URL"',
+    '"\\u0049NPUT_GITHUB-API-URL"',
+    '"\\U00000049NPUT_GITHUB-API-URL"',
+    '"INPUT\\\n          _GITHUB-API-URL"',
+  ];
+  for (const file of NAMES) {
+    for (const key of spellings) {
+      const messages = found(file, `${base(file).trimEnd()}\n# ${key}: x\n`);
+      assert.deepEqual(messages, [ESCAPE], `${file}: ${key}`);
+    }
+    // A CR LF line ending keeps the backslash last.
+    assert.deepEqual(found(file, `${base(file).trimEnd()}\n# "INPUT\\\r\n# _X": x\n`), [ESCAPE], `${file}: CR LF`);
+    // Other escapes cannot spell a key letter, and a backslash before the end of the line is not a continuation.
+    assert.deepEqual(found(file, `${base(file).trimEnd()}\n# printf 'a\\n\\t' "\\N" x\\.y \\\\ \\x4 \\u004 z\n`), [], file);
+  }
+  // As a step env: key on each mint, and as a job env: key on merge in dependabot-merge.yml.
+  for (const [file, id] of MINTS) {
+    for (const key of spellings) {
+      const text = inMint(id, (s) => s.replace('        with:\n', `        env:\n          ${key}: https://${PLANTED_HOST}\n        with:\n`))(base(file));
+      const messages = found(file, text);
+      assert.deepEqual(messages, [ESCAPE], `${file} ${id}: ${key}`);
+    }
+  }
+  const jobEnv = found('dependabot-merge.yml', sub('    environment: ircx-bot\n', '    environment: ircx-bot\n    env:\n      "\\x49NPUT_GITHUB-API-URL": x\n')(base('dependabot-merge.yml')));
+  assert.deepEqual(jobEnv, [ESCAPE]);
+  // The real files hold a \n in a printf format and a \. in a tag pattern, and neither is a finding.
+  assert.ok(SC.split('\n').some((l) => l.includes("printf 'The weekly settings check found drift.\\n")));
+  assert.ok(CR.split('\n').some((l) => l.includes('(\\.[2-9])?$')));
+  for (const file of NAMES) {
+    assert.deepEqual(found(file, workflow(file)), [], file);
+  }
+});
+
+test('SC-U2-54 d an env: key with a value on its own line, or fromJSON in any case, on any of the five workflows is a W11 finding', () => {
+  const ENV = 'an env: key holds a block mapping on the lines below it and nothing after its colon';
+  const FROM_JSON = 'no fromJSON in any case, since it can build an env: mapping at run time';
+  const found = (file: string, text: string): string[] =>
+    structuralFindings(file, text)
+      .filter((f) => f.rule === 'W11')
+      .map((f) => f.message);
+  // An expression that builds an INPUT_ key at run time, with no INPUT_ text and no escape on the line.
+  const built = `\${{ fromJSON(format('{{"{0}NPUT_GITHUB-API-URL":"x"}}', 'I')) }}`;
+  // Each value an env: key could hold on its own line, and the W11 messages it gives.
+  const values: (readonly [value: string, messages: readonly string[]])[] = [
+    [built, [ENV, FROM_JSON]],
+    ['${{ vars }}', [ENV]],
+    ['"${{ github.event.client_payload }}"', [ENV]],
+    [">-\n  ${{ github.event.client_payload }}", [ENV]],
+    ['{ FOO: x }', [ENV]],
+    ['*shared', [ENV]],
+  ];
+  for (const file of NAMES) {
+    for (const [value, messages] of values) {
+      // Workflow level, as a top-level key after the jobs.
+      assert.deepEqual(found(file, `${base(file).trimEnd()}\nenv: ${value}\n`), messages, `${file} workflow: ${value}`);
+      // Step level, as the first key of an added step.
+      assert.deepEqual(found(file, `${base(file).trimEnd()}\n      - env: ${value}\n        run: echo\n`), messages, `${file} step: ${value}`);
+    }
+    for (const spelling of ['"env": ${{ vars }}', "'env': ${{ vars }}", 'env : ${{ vars }}', '      - { name: x, env: ${{ vars }} }']) {
+      assert.deepEqual(found(file, `${base(file).trimEnd()}\n${spelling}\n`), [ENV], `${file}: ${spelling}`);
+    }
+    for (const word of ['fromJSON(x)', 'FromJson(x)', 'fromjson (x)', 'FROMJSON']) {
+      const messages = found(file, `${base(file).trimEnd()}\n# ${word}\n`);
+      assert.deepEqual(messages, [FROM_JSON], `${file}: ${word}`);
+      assert.ok(!messages[0]?.includes(word), `${file}: the message echoes ${word}`);
+    }
+    // A comment after the colon, the env context and words that end in env are not an env: value.
+    assert.deepEqual(found(file, `${base(file).trimEnd()}\n    env:   # the token\n# printenv: x \${{ env.FOO }} myenv: y environment: ircx-bot\n`), [], file);
+  }
+  // Job level, on merge in dependabot-merge.yml, and step level on each mint.
+  for (const [value, messages] of values) {
+    const job = found('dependabot-merge.yml', sub('    environment: ircx-bot\n', `    environment: ircx-bot\n    env: ${value}\n`)(base('dependabot-merge.yml')));
+    assert.deepEqual(job, messages, `job: ${value}`);
+    for (const [file, id] of MINTS) {
+      const step = found(file, inMint(id, (st) => st.replace('        with:\n', `        env: ${value}\n        with:\n`))(base(file)));
+      assert.deepEqual(step, messages, `${file} ${id}: ${value}`);
+      assert.ok(!step.some((m) => m.includes(value)), `${file} ${id}: the message echoes the value`);
+    }
+  }
+  // The real files hold env: blocks whose keys take expressions as values, and that is not a finding.
+  assert.ok(CR.includes('        env:\n          GH_TOKEN: ${{ github.token }}\n'));
+  assert.ok(SC.includes('        env:\n          REPOSITORY: ${{ needs.read.outputs.repository }}\n'));
+  for (const file of NAMES) {
+    assert.deepEqual(found(file, workflow(file)), [], file);
+  }
+});
+
 test('SC-U2-47 W12 and W13: github.actor, a debug switch and the CI name', () => {
   for (const file of NAMES) {
     for (const text of ['github.actor', 'set -x', 'GH_DEBUG', 'ACTIONS_STEP_DEBUG']) {

@@ -572,6 +572,13 @@ test('S5: a github.com reference spelled any other way than this repository is a
     cat('github.com/ircx-io/ircx-docs', '.git.evil'),
     cat('https://github.com', './someone/other'),
     cat('see github.com', '/someone/other.'),
+    // G1: still findings with one trailing full stop trimmed. The host-tail check finds each as well, so they pin the end result and not the trim.
+    cat('see github.com/ircx-io/ircx-docs', '..'),
+    cat('see github.com/ircx-io/ircx-docs', '.git..'),
+    cat('github.com/ircx-io/ircx-docs', '.git.git'),
+    cat('github.com', '/ircx-io./ircx-docs'),
+    cat('github.com', '/ircx-io./ircx-docs.'),
+    cat('github.com', '/ircx-io/other.'),
   ];
   for (const line of findings) {
     assert.ok(scanLine(line).includes('S5'), line);
@@ -587,6 +594,12 @@ test('S5: a github.com reference spelled any other way than this repository is a
     cat('https://github.com', '/'),
     cat('https://github.com/ircx-io', '/'),
     cat('https://github.com', '.evil.example/x'),
+    // G1: one full stop at the end of a sentence follows the repository link.
+    cat('see github.com/ircx-io/ircx-docs', '.'),
+    cat('https://github.com/ircx-io/ircx-docs', '.git.'),
+    cat('see GitHub.com/IRCX-IO/ircx-docs', '.'),
+    cat('see github.com/ircx-io/ircx-docs', '. It is public.'),
+    cat('(github.com/ircx-io/ircx-docs', ').'),
   ];
   for (const line of clean) {
     assert.deepEqual(scanLine(line), [], line);

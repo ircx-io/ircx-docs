@@ -515,7 +515,11 @@ function indentOf(line: string): number {
   return line.length - line.trimStart().length;
 }
 
-/** Splits the `jobs:` mapping into jobs (two-space keys) and their steps (six-space items). */
+/**
+ * Splits the `jobs:` mapping into jobs (two-space keys) and their steps
+ * (six-space items). The mapping ends at the next column-0 line that is not a
+ * comment, so a column-0 comment hides no later job or step.
+ */
 function parseJobs(lines: readonly string[]): Job[] {
   const jobs: Job[] = [];
   const top = lines.findIndex((l) => l === 'jobs:');
@@ -526,7 +530,7 @@ function parseJobs(lines: readonly string[]): Job[] {
   let end = lines.length;
   for (let i = top + 1; i < lines.length; i++) {
     const line = lines[i] ?? '';
-    if (/^\S/.test(line)) {
+    if (/^[^\s#]/.test(line)) {
       end = i;
       break;
     }
@@ -703,7 +707,7 @@ export function structuralFindings(name: string, text: string): Finding[] {
     }
   }
 
-  // W11: every App token step names this App, this owner and this repository, and asks for something.
+  // W11: every App token step names this App, this owner and this repository, asks for something, and sets no other input in its with: block.
   // In settings-check.yml every permission is read, except on the merge-token step, which W14 governs.
   for (const job of jobs) {
     for (const step of job.steps) {
@@ -728,6 +732,7 @@ export function structuralFindings(name: string, text: string): Finding[] {
       if (inputs.some((l) => l.startsWith('skip-token-revoke'))) {
         problems.push('no skip-token-revoke');
       }
+      problems.push(...withBlockProblems(step.lines));
       if (name === 'settings-check.yml' && stepId(step) !== MERGE_TOKEN && permissions.some((l) => !/^permission-[a-z-]+: read$/.test(l))) {
         problems.push('read permissions only');
       }
@@ -736,6 +741,31 @@ export function structuralFindings(name: string, text: string): Finding[] {
       }
     }
   }
+
+  // W11: an action reads each input from the environment variable INPUT_<NAME>,
+  // so an env: key of that form would set an App token input outside its with:
+  // block. No workflow holds the text INPUT_ in any case. A YAML escape spells a
+  // key without its text (\x49NPUT_ is INPUT_), and an escaped line break splits
+  // it across two lines, so no line holds a hex or unicode escape or ends in a
+  // backslash either. An expression can also build the key at run time
+  // (env: ${{ fromJSON(...) }}), so no line calls fromJSON, which turns a string
+  // into a mapping, and an env: key takes nothing after its colon but a comment.
+  // The test reads one line, so a value that starts on a later line is not
+  // matched here; the canonical compare (W4) refuses any edit to these files.
+  lines.forEach((line, i) => {
+    if (/input_/i.test(line)) {
+      push(i, 'W11', 'no INPUT_ text in any case, since an env: key of that form sets an action input');
+    }
+    if (/\\(?:x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})|\\\r?$/.test(line)) {
+      push(i, 'W11', 'no YAML hex or unicode escape and no line ending in a backslash');
+    }
+    if (/(?:^|[\s{,"'])env["']?\s*:(?!\s*(?:#.*)?\r?$)/.test(line)) {
+      push(i, 'W11', 'an env: key holds a block mapping on the lines below it and nothing after its colon');
+    }
+    if (/fromjson/i.test(line)) {
+      push(i, 'W11', 'no fromJSON in any case, since it can build an env: mapping at run time');
+    }
+  });
 
   // W13: only ci.yml is named CI, because the merge workflow and the required check key on it.
   if (name !== 'ci.yml' && lines.includes('name: CI')) {
@@ -746,6 +776,40 @@ export function structuralFindings(name: string, text: string): Finding[] {
     mergeTokenFindings(lines, jobs, shell, push);
   }
   return findings;
+}
+
+/** The inputs an App token step may set: a trimmed line of its `with:` block matches this. */
+const APP_TOKEN_INPUT = /^(client-id|private-key|owner|repositories|permission-[a-z-]+):( |$)/;
+
+/**
+ * The W11 problems of an App token step's `with:` block. The step has exactly
+ * one `with:` key, written as `with:` alone on its line. The block is every
+ * line after it up to the first line that is neither blank nor a comment and
+ * is indented no deeper than `with:`. Blank and comment lines neither end the
+ * block nor count as inputs; every other line of the block sets one of the
+ * inputs `APP_TOKEN_INPUT` allows.
+ */
+function withBlockProblems(lines: readonly string[]): string[] {
+  const keys = lines.flatMap((l, k) => (/^\s*(?:- )?["']?with["']?\s*:/.test(l) ? [k] : []));
+  const at = keys[0];
+  if (keys.length !== 1 || at === undefined || (lines[at] ?? '').trim() !== 'with:') {
+    return ['one with: key alone on its line'];
+  }
+  const indent = indentOf(lines[at] ?? '');
+  for (let k = at + 1; k < lines.length; k++) {
+    const line = lines[k] ?? '';
+    const trimmed = line.trim();
+    if (trimmed === '' || trimmed.startsWith('#')) {
+      continue;
+    }
+    if (indentOf(line) <= indent) {
+      break;
+    }
+    if (!APP_TOKEN_INPUT.test(trimmed)) {
+      return ['only client-id, private-key, owner, repositories and permission- inputs'];
+    }
+  }
+  return [];
 }
 
 const MERGE_TOKEN = 'merge-token';
@@ -891,6 +955,97 @@ const READ_JOB: readonly string[] = [
   ...MERGE_TOKEN_STEP,
   ...MERGE_OPTIONS_STEP,
 ];
+/**
+ * settings-check.yml, line for line, with every `uses:` pin normalised as W4
+ * normalises it: the lines before job read, job read, one blank line and job
+ * compare. Like `READ_JOB` it is written out, so W14 does not depend on W4.
+ */
+const SETTINGS_CHECK: readonly string[] = [
+  ...`name: Settings check
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:`.split('\n'),
+  ...READ_JOB,
+  '',
+  ...`  compare:
+    needs: read
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@<sha> # <version>
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@<sha> # <version>
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Write the responses to files
+        env:
+          REPOSITORY: \${{ needs.read.outputs.repository }}
+          ACTIONS_PERMISSIONS: \${{ needs.read.outputs.actions-permissions }}
+          SELECTED_ACTIONS: \${{ needs.read.outputs.selected-actions }}
+          WORKFLOW_PERMISSIONS: \${{ needs.read.outputs.workflow-permissions }}
+          FORK_PR_APPROVAL: \${{ needs.read.outputs.fork-pr-approval }}
+          VULNERABILITY_ALERTS: \${{ needs.read.outputs.vulnerability-alerts }}
+          PRIVATE_VULNERABILITY_REPORTING: \${{ needs.read.outputs.private-vulnerability-reporting }}
+          RULESETS: \${{ needs.read.outputs.rulesets }}
+          ACTIONS_SECRETS: \${{ needs.read.outputs.actions-secrets }}
+          DEPENDABOT_SECRETS: \${{ needs.read.outputs.dependabot-secrets }}
+          ENVIRONMENT_SECRETS: \${{ needs.read.outputs.environment-secrets }}
+          ENVIRONMENT_VARIABLES: \${{ needs.read.outputs.environment-variables }}
+          ENVIRONMENTS: \${{ needs.read.outputs.environments }}
+          BRANCH_POLICIES: \${{ needs.read.outputs.branch-policies }}
+          RELEASES: \${{ needs.read.outputs.releases }}
+          MERGE_OPTIONS: \${{ needs.read.outputs.merge-options }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/settings"
+          mkdir -p "$dir"
+          printf '%s' "$REPOSITORY" > "$dir/repository.json"
+          printf '%s' "$ACTIONS_PERMISSIONS" > "$dir/actions-permissions.json"
+          printf '%s' "$SELECTED_ACTIONS" > "$dir/selected-actions.json"
+          printf '%s' "$WORKFLOW_PERMISSIONS" > "$dir/workflow-permissions.json"
+          printf '%s' "$FORK_PR_APPROVAL" > "$dir/fork-pr-approval.json"
+          printf '%s' "$VULNERABILITY_ALERTS" > "$dir/vulnerability-alerts.json"
+          printf '%s' "$PRIVATE_VULNERABILITY_REPORTING" > "$dir/private-vulnerability-reporting.json"
+          printf '%s' "$RULESETS" > "$dir/rulesets.json"
+          printf '%s' "$ACTIONS_SECRETS" > "$dir/actions-secrets.json"
+          printf '%s' "$DEPENDABOT_SECRETS" > "$dir/dependabot-secrets.json"
+          printf '%s' "$ENVIRONMENT_SECRETS" > "$dir/environment-secrets.json"
+          printf '%s' "$ENVIRONMENT_VARIABLES" > "$dir/environment-variables.json"
+          printf '%s' "$ENVIRONMENTS" > "$dir/environments.json"
+          printf '%s' "$BRANCH_POLICIES" > "$dir/branch-policies.json"
+          printf '%s' "$RELEASES" > "$dir/releases.json"
+          printf '%s' "$MERGE_OPTIONS" > "$dir/merge-options.json"
+      - id: compare
+        run: |
+          set -o pipefail
+          node src/settings.ts "$RUNNER_TEMP/settings" | tee "$RUNNER_TEMP/findings.txt"
+      - name: Report the drift in an issue
+        if: failure() && steps.compare.outcome == 'failure'
+        env:
+          GH_TOKEN: \${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body="$(printf 'The weekly settings check found drift.\\n\\nFindings:\\n\\n%s\\n\\nRun: %s\\n' "$(cat "$RUNNER_TEMP/findings.txt")" "$run_url")"
+          number="$(gh api "repos/ircx-io/ircx-docs/issues?state=open&labels=settings-drift" --jq '[.[] | select(.user.login == "github-actions[bot]" and (.pull_request | not))][0].number // ""')"
+          if [[ "$number" =~ ^[1-9][0-9]{0,9}$ ]]; then
+            gh api -X POST "repos/ircx-io/ircx-docs/issues/$number/comments" -f "body=$body" > /dev/null
+          else
+            gh api -X POST repos/ircx-io/ircx-docs/issues -f "title=Weekly settings check found drift" -f "body=$body" -f "labels[]=settings-drift" > /dev/null
+          fi`.split('\n'),
+];
 /** The word `steps` in any case, outside a longer name. The caller strips a `steps:` key first. */
 const STEPS_WORD = /(?<![\w-])steps(?![\w-])/gi;
 /** The one shape a `steps` reference may take: one step's named output, or its outcome. */
@@ -903,12 +1058,18 @@ const FILE_COMMANDS: readonly string[] = ['GITHUB_ENV', 'GITHUB_PATH', 'GITHUB_S
  * W14 (settings-check.yml): the Contents-write token is minted only as the
  * second-to-last step of the read job and reaches only the last step,
  * `merge-options`, through one env key; that step makes one GET of the
- * repository and writes only its own output. The pins cover the lines
- * `parseJobs` sees and the `defaults:` and `env:` spellings clause 1 matches;
- * a column-0 comment inside job read or a workflow-level complex key escapes
- * them, and W4 alone catches those.
+ * repository and writes only its own output. Beside the pins on job read and
+ * its steps, the whole file is compared line for line with `SETTINGS_CHECK`, so
+ * a line those pins do not read, such as a column-0 comment inside job read, a
+ * workflow-level complex key or a change to job compare, is a W14 finding too.
+ * That finding is reported only when no other W14 finding names the change.
  */
-function mergeTokenFindings(lines: readonly string[], jobs: readonly Job[], shell: ReadonlySet<number>, push: (line: number | undefined, rule: string, message: string) => void): void {
+function mergeTokenFindings(lines: readonly string[], jobs: readonly Job[], shell: ReadonlySet<number>, report: (line: number | undefined, rule: string, message: string) => void): void {
+  let named = false;
+  const push = (line: number | undefined, rule: string, message: string): void => {
+    named = true;
+    report(line, rule, message);
+  };
   // No default shell or working directory, and no env that every step of a job inherits.
   lines.forEach((line, i) => {
     if (/^\s*(?:- )?["']?defaults["']?\s*:/.test(line)) {
@@ -968,7 +1129,7 @@ function mergeTokenFindings(lines: readonly string[], jobs: readonly Job[], shel
   if (lines.filter((l) => /merge-token/i.test(l)).length !== 2) {
     push(undefined, 'W14', `merge-token is named on exactly two lines: - id: ${MERGE_TOKEN} and ${MERGE_TOKEN_ENV}`);
   }
-  // No line of job read outside merge-options names GITHUB_ENV or GITHUB_PATH. The job pin below holds the rest of the lines `parseJobs` sees; a column-0 comment ends that view, and W4 alone stands there.
+  // No line of job read outside merge-options names GITHUB_ENV or GITHUB_PATH. The job pin and the whole-file pin below hold the rest of its lines.
   const read = jobs.find((j) => j.name === 'read');
   read?.lines.forEach((line, k) => {
     const i = read.start + k;
@@ -1023,13 +1184,21 @@ function mergeTokenFindings(lines: readonly string[], jobs: readonly Job[], shel
   if (step === undefined || !sameLines(step.lines, MERGE_OPTIONS_STEP)) {
     push(step?.start, 'W14', 'the merge-options step is exactly its canonical lines');
   }
-  // Job read as `parseJobs` sees it is pinned, so a changed job key (container, runs-on) or added shell in the step read fails W14. `parseJobs` stops at a column-0 line, a comment included, so lines after one are not compared here.
+  // Job read as `parseJobs` sees it is pinned, so a changed job key (container, runs-on) or added shell in the step read fails W14 with a message naming the job.
   const readLines = read === undefined ? [] : normalise('', read.lines.join('\n'), new Map()).text.split('\n');
   while (readLines.length > 0 && (readLines.at(-1) ?? '').trim() === '') {
     readLines.pop();
   }
   if (!sameLines(readLines, READ_JOB)) {
     push(read?.start, 'W14', 'job read is exactly its canonical lines, its uses: pins aside');
+  }
+  // The whole file is pinned too, so no line the clauses above do not read changes how a step runs.
+  const fileLines = normalise('', lines.join('\n'), new Map()).text.split('\n');
+  while (fileLines.length > 0 && (fileLines.at(-1) ?? '').trim() === '') {
+    fileLines.pop();
+  }
+  if (!named && !sameLines(fileLines, SETTINGS_CHECK)) {
+    report(0, 'W14', 'settings-check.yml is exactly its canonical lines, its uses: pins aside');
   }
 }
 

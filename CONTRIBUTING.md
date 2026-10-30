@@ -45,6 +45,7 @@ GitHub-flavoured Markdown, with these limits:
 
 - Headings run from `##` to `####`. The page title comes from front matter, so `#` is refused, and so is `#####` and deeper.
 - No raw HTML, no HTML comments, no images and no task-list items.
+- No character reference outside code, named or numeric, such as `&lt;`, `&amp;`, `&#60;` or `&#x3C;`. The site build refuses one, because a named reference would show as typed and a numeric one turns the other `&` signs in its text into a visible `&amp;`. Write the character itself, as `\<` where a `<` would start a tag. In a code span or a code block the text shows as written.
 - A paragraph may hold at most 256 `*`, `_` and `~` characters together.
 - Links are one of three kinds:
   - another page, as a relative path to its `.md` file, optionally with a heading: `./irc-client.md#server-settings`;

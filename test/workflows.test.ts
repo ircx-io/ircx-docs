@@ -815,7 +815,7 @@ test('SC-U2-47 W14 job read is exactly its canonical lines, its uses: pins aside
   for (const [name, edit] of edits) {
     assert.deepEqual(w14(edit), [READ_JOB_FINDING], name);
   }
-  // Near misses: a SHA and version bump of either App token uses: line, and an edit to job compare alone.
+  // Near misses: a SHA and version bump of either App token uses: line passes, and an edit to job compare alone is not a job read finding.
   for (const n of [0, 1]) {
     let k = 0;
     const bump = (text: string): string =>
@@ -827,10 +827,124 @@ test('SC-U2-47 W14 job read is exactly its canonical lines, its uses: pins aside
     k = 0;
     assert.deepEqual(w14(bump), [], `App token uses: line ${n}`);
   }
-  assert.deepEqual(w14(sub('    if: always()\n', '    if: success() || failure()\n')), []);
+  assert.deepEqual(w14(sub('    if: always()\n', '    if: success() || failure()\n')), ['settings-check.yml is exactly its canonical lines, its uses: pins aside']);
 });
 
 test('SC-U2-47 W14 a workflow without a job named read is also a job read finding', () => {
   // Renamed, the job is not found, so the whole-job clause compares an empty job and fails on its own account.
   assert.ok(w14(sub('  read:\n    runs-on', '  reed:\n    runs-on')).includes(READ_JOB_FINDING));
+});
+
+// ---------------------------------------------------------------------------
+// SC-U2-53: F-4 and F-5. parseJobs ends the jobs: mapping only at a column-0
+// line that is not a comment, and the whole of settings-check.yml is pinned.
+
+const WHOLE_FILE_FINDING = 'settings-check.yml is exactly its canonical lines, its uses: pins aside';
+
+/** The sorted rule ids that dependabot-merge.yml gets from the structural rules after `transform`. */
+function dmRules(transform: (text: string) => string): string[] {
+  return [...new Set(structuralFindings(DM, transform(FILES[DM] ?? '')).map((f) => f.rule))].sort();
+}
+
+/** A checkout step added to the merge job, which names the ircx-bot environment, before its first mint. */
+const CHECKOUT_BEFORE_MINT = '      - id: contents-token\n';
+const checkoutInMerge = sub(CHECKOUT_BEFORE_MINT, `${CHECKOUT_STEP}${CHECKOUT_BEFORE_MINT}`);
+
+/** The places a column-0 comment can sit in dependabot-merge.yml; each returns the file with `comment` there. */
+const COMMENT_PLACES: readonly (readonly [place: string, put: (comment: string) => (text: string) => string])[] = [
+  ['between decide and merge', (c) => sub('\n  merge:\n', `\n${c}\n  merge:\n`)],
+  ['on the line after jobs:', (c) => sub('\njobs:\n', `\njobs:\n${c}\n`)],
+  ['between two steps of merge', (c) => sub(CHECKOUT_BEFORE_MINT, `${c}\n${CHECKOUT_BEFORE_MINT}`)],
+];
+
+test('SC-U2-53 a column-0 comment does not hide a later job from W10', () => {
+  assert.ok(dmRules(checkoutInMerge).includes('W10'), 'control: a checkout step in merge is a W10 finding');
+  for (const comment of ['# c', '#c', '#', '# c\n#c']) {
+    for (const [place, put] of COMMENT_PLACES) {
+      const label = `${JSON.stringify(comment)} ${place}`;
+      // The real file with the comment has no finding: merge is still the job that names the environment.
+      assert.deepEqual(dmRules(put(comment)), [], label);
+      // The checkout step after the comment is still seen.
+      assert.ok(dmRules((t) => checkoutInMerge(put(comment)(t))).includes('W10'), label);
+    }
+  }
+});
+
+test('SC-U2-53 a column-0 line that is not a comment still ends the jobs mapping', () => {
+  const job = 'merge:\n    environment: ircx-bot\n    steps:\n      - run: node x.js\n';
+  // After a column-0 comment the job-shaped lines are one more job of jobs:, and W10 sees the node command.
+  assert.ok(dmRules((t) => `${t}\n# extra\n  ${job}`).includes('W10'), 'control');
+  // After a column-0 key they belong to that key, not to jobs:.
+  for (const key of ['extra:', 'x', '---', '"y"']) {
+    assert.ok(!dmRules((t) => `${t}\n${key}\n  ${job}`).includes('W10'), key);
+  }
+});
+
+test('SC-U2-53 a column-0 comment inside job read is a W14 finding', () => {
+  // Before the merge-token step: the mint after the comment is still a step of job read.
+  for (const comment of ['# c', '#c']) {
+    assert.deepEqual(w14(sub('      - id: merge-token\n', `${comment}\n      - id: merge-token\n`)), [READ_JOB_FINDING], comment);
+  }
+  // After the last step of job read: the comment is the job's last line, so the job is not its canonical lines.
+  assert.deepEqual(w14(sub('\n\n  compare:\n', '\n# c\n\n  compare:\n')), [READ_JOB_FINDING]);
+});
+
+test('SC-U2-53 a workflow-level complex key ? env is a W14 finding', () => {
+  assert.deepEqual(w14(sub('\njobs:\n', '\n? env\n: {BASH_ENV: /tmp/x}\n\njobs:\n')), [WHOLE_FILE_FINDING]);
+  assert.deepEqual(w14(sub('\njobs:\n', '\n? "env"\n:\n  BASH_ENV: /tmp/x\n\njobs:\n')), [WHOLE_FILE_FINDING]);
+});
+
+test('SC-U2-53 a workflow-level complex key ? defaults with a run shell is a W14 finding', () => {
+  const shell = `"bash -c 'env >&2; bash {0}' {0}"`;
+  assert.deepEqual(w14(sub('\njobs:\n', `\n? defaults\n: {run: {shell: ${shell}}}\n\njobs:\n`)), [WHOLE_FILE_FINDING]);
+  assert.deepEqual(w14(sub('\njobs:\n', `\n? defaults\n:\n  run:\n    shell: ${shell}\n\njobs:\n`)), [WHOLE_FILE_FINDING]);
+});
+
+test('SC-U2-53 a changed line in job compare is a W14 finding', () => {
+  const edits: readonly (readonly [name: string, edit: (text: string) => string])[] = [
+    ['its if', sub('    if: always()\n', '    if: success() || failure()\n')],
+    ['its timeout', sub('    timeout-minutes: 10\n    permissions:\n      contents: read\n      issues: write\n', '    timeout-minutes: 11\n    permissions:\n      contents: read\n      issues: write\n')],
+    ['its checker command', sub('node src/settings.ts "$RUNNER_TEMP/settings"', 'node src/settings.ts --skip "$RUNNER_TEMP/settings"')],
+    ['its issue command', sub('gh api -X POST repos/ircx-io/ircx-docs/issues -f', 'gh api -X POST repos/ircx-io/ircx-docs/issues --input /dev/null -f')],
+    ['its permissions', sub('      issues: write\n    steps:\n      - uses: actions/checkout', '      issues: write\n      actions: write\n    steps:\n      - uses: actions/checkout')],
+    ['a step added after its last step', (t) => `${t.trimEnd()}\n      - run: true\n`],
+  ];
+  for (const [name, edit] of edits) {
+    assert.deepEqual(w14(edit), [WHOLE_FILE_FINDING], name);
+  }
+});
+
+test('SC-U2-53 a change to the lines before jobs: is a W14 finding', () => {
+  assert.deepEqual(w14(sub("    - cron: '17 6 * * 1'\n", "    - cron: '17 6 * * 2'\n")), [WHOLE_FILE_FINDING], 'the schedule');
+  assert.deepEqual(w14(sub('  workflow_dispatch:\n', '  workflow_dispatch:\n  push:\n')), [WHOLE_FILE_FINDING], 'a trigger');
+  assert.deepEqual(w14(sub('name: Settings check\n', 'name: Settings check x\n')), [WHOLE_FILE_FINDING], 'the name');
+});
+
+test('SC-U2-53 deleting any line of settings-check.yml, or extending any line that is not a uses: pin, is a W14 finding', () => {
+  const lines = (FILES[SC] ?? '').split('\n');
+  assert.equal(lines.at(-1), '');
+  const pin = /^\s*(?:- )?uses: actions\/[a-z-]+@[0-9a-f]{40} # v[0-9.]+$/;
+  assert.ok(lines.length > 150, 'the whole file is walked');
+  lines.slice(0, -1).forEach((line, i) => {
+    const gone = lines.filter((_, k) => k !== i).join('\n');
+    assert.notEqual(w14(() => gone).length, 0, `deleting line ${i + 1}`);
+    if (!pin.test(line)) {
+      const longer = lines.map((l, k) => (k === i ? `${l}x` : l)).join('\n');
+      assert.notEqual(w14(() => longer).length, 0, `extending line ${i + 1}`);
+    }
+  });
+});
+
+test('SC-U2-53 trailing blank lines after settings-check.yml are not a W14 finding, other edits at the ends are', () => {
+  for (const tail of ['\n', '\n\n\n', '\n  \n\t\n']) {
+    assert.deepEqual(w14((t) => t + tail), [], JSON.stringify(tail));
+  }
+  assert.deepEqual(w14((t) => `\n${t}`), [WHOLE_FILE_FINDING], 'a leading blank line');
+  assert.deepEqual(w14((t) => `${t}# c\n`), [WHOLE_FILE_FINDING], 'a trailing comment');
+});
+
+test('SC-U2-53 the whole-file finding is reported once, at the first line of settings-check.yml', () => {
+  const text = sub('\njobs:\n', '\n? env\n: {BASH_ENV: /tmp/x}\n\njobs:\n')(FILES[SC] ?? '');
+  const found = structuralFindings(SC, text).filter((f) => f.rule === 'W14');
+  assert.deepEqual(found, [{ file: '.github/workflows/settings-check.yml', line: 1, rule: 'W14', message: WHOLE_FILE_FINDING }]);
 });
